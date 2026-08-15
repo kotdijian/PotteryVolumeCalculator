@@ -1,97 +1,123 @@
-# Pottery Volume Calculator
+# PotteryVolumeCalculator v1.0
 
-OBJ / PLY 形式の土器3Dメッシュから、**液体が最初に外へ溢れ出す直前までの最大内容量**をボクセル法で推定する実験用Pythonスクリプトです。
+OBJ / PLY 形式の土器3Dメッシュから、**液体が最初に外へ溢れ出す直前までの最大内容量**をボクセル法で推定する実験用ツールです。
 
-このREADMEは、Pythonをほとんど使ったことがない研究者でも実行できることを想定しています。
-
-**Version: 0.3.2**
+Pythonを初めて使う文系・考古学系研究者でも試せるように、インストールから結果の確認まで順番に説明します。
 
 ---
 
-## 1. このプログラムが求める「容積」
+## 1. v1で何を計算するか
 
-このプログラムでは、土器の内容積を次のように定義します。
+このプログラムでは「土器の容量」を、
 
-> 土器を通常の姿勢で置き、液面を水平に保ったまま液体を増やしていったとき、最も低い口縁などから液体が初めて外へ流出する直前までに保持できる最大容量。
+> **土器をZ軸方向に直立させた状態で、液体が最初に外へ流出する直前まで保持できる最大内容量**
 
-したがって、口縁が完全に水平である必要はありません。
+と定義します。
 
-波状口縁や多少傾いた口縁の場合も、仮想的な水平の蓋を作るのではなく、**内部空間が外部へ初めてつながる高さ（spill level）**を探索します。
+口縁が完全に水平でなくても構いません。
+
+処理は概ね次の順序です。
 
 ```text
-液面を上昇
-     ↓
-内部空間がまだ外部へつながらない
-     ↓
-さらに上昇
-     ↓
-最初に外部へ流出する高さ = spill level
-     ↓
-その1ボクセル下までの内部空間を容量として計算
+OBJ / PLY
+   ↓
+PyMeshLabでトポロジー検査
+   ↓
+完全同一座標の重複頂点だけを整理
+   ↓
+Trimeshで再検査
+   ↓
+内部計算用にmmへ変換
+   ↓
+surface voxelization
+   ↓
+土器内部のseedを取得
+   ↓
+高さ制限付き3D Flood Fill
+   ↓
+最初に外へつながるspill levelを探索
+   ↓
+spill直前までの内部空間を計数
+   ↓
+最大保持液量
 ```
 
 ---
 
-## 2. 現在の対象
-
-まず単純な器形で方法を検証するため、次のような資料を対象とします。
+## 2. v1の対象
 
 ### 適している資料
 
-- 単口縁
-- 大きな突起・把手・注口がない
-- 内面が比較的滑らか
+- 単純な単口縁
+- 口縁に大きな突起がない
+- 把手・注口がない
+- 内面が滑らか
 - 大きな欠損がない
-- 土器全体の内外面を含むメッシュがある
+- 土器全体の内外面を含む三角形メッシュ
 - 土器をZ軸方向に直立させられる
 
-### 現段階では慎重に扱う資料
+### 現段階では注意が必要な資料
 
 - 大きな波状口縁
-- 把手・注口を持つ器
-- 複雑な突起を持つ器
-- 大きく欠損した資料
-- 復元部や穴埋め部を多く含む資料
-- 内部に仕切りなどがある器
+- 把手・注口
+- 内部突起
+- 大きな欠損
+- 接合されていない復元片を多数含むモデル
+- 多数の自己交差やnon-manifold部分を含むモデル
 
 ---
 
-## 3. 入力ファイル
+## 3. PyMeshLabを導入した理由
 
-使用できる形式は次の2種類です。
+v1では、Trimeshだけでなく**PyMeshLabを独立したQA検査器**として使用します。
 
-- `PLY`
-- `OBJ`
+これは、MeshLab GUIとTrimeshでトポロジー判定が異なる場合を切り分けるためです。
 
-容量計算だけであれば、テクスチャは使用しません。計測用にはPLYを推奨します。
+PyMeshLabでは、
 
-### 座標単位
+- Boundary Edges
+- Connected Components
+- 2-manifoldかどうか
+- non-2-manifold edges / vertices
+- holes
+- genus
 
-入力メッシュは次の単位に対応します。
+などを記録します。
 
-- `mm`
-- `cm`
-- `m`
+その後、
 
-実行時に `--unit` で指定します。
+- `Remove Duplicate Vertices`
+- `Remove Unreferenced Vertices`
 
-```bash
-# mm単位
-python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
+だけを実行します。
 
-# m単位
-python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 1.0
-```
+### v1では自動実行しない処理
 
-内部ではmmに変換してから計算します。元のPLY / OBJファイルは変更しません。
+次の処理は形状やトポロジーそのものを変える可能性があるため、自動では行いません。
 
-`--pitch` は入力ファイルの単位に関係なく、常に **mm** です。
+- Close Holes
+- Merge Close Vertices
+- Repair non-manifold edges
+- Repair non-manifold vertices
+
+したがって、入力データの問題をプログラムが勝手に「修復」して容量を変えてしまうことを避けています。
 
 ---
 
-## 4. メッシュの姿勢
+# 4. 入力メッシュの条件
 
-土器の上下方向を **Z軸** に合わせてください。
+## ファイル形式
+
+- PLY
+- OBJ
+
+を使用できます。
+
+容量計算ではテクスチャを使用しないため、計測用にはPLYを推奨します。
+
+## 上下方向
+
+**Z軸を上下方向**にしてください。
 
 ```text
        +Z
@@ -104,130 +130,260 @@ python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 1.0
     \________/
 ```
 
-CloudCompareなどで回転してからPLYとして保存すると分かりやすいです。
+口縁が上、底が下です。
 
-実行前には最低限、次を確認してください。
+## 単位
 
-1. 口縁が上、底部が下
-2. Z軸がおおむね鉛直方向
-3. 入力単位が分かっている
-4. 明らかな大穴や不要な別メッシュがない
+入力座標は次の3種類に対応しています。
+
+```text
+mm
+cm
+m
+```
+
+実行時に明示します。
+
+例：
+
+```bash
+--unit mm
+```
+
+または、
+
+```bash
+--unit m
+```
+
+### 単位は自動判定しません
+
+高さ30 cmの土器なら、
+
+```text
+mmデータ   約300
+cmデータ   約30
+mデータ    約0.30
+```
+
+です。
+
+小型・大型資料では数値だけから単位を確実に推定できないため、必ず指定してください。
 
 ---
 
-# 5. 最初の準備
+# 5. 内部計算と出力単位
 
-## 5.1 Pythonの確認
+計算精度と実装を統一するため、**内部ではすべてmmに変換して計算**します。
 
-このプログラムはPython 3を使用します。
+ただし、最終出力は入力単位へ戻します。
 
-macOSでは「ターミナル」を開き、次を入力します。
+例えば入力がmの場合、
+
+```bash
+python3 vessel_voxel_volume.py pottery.ply --unit m --pitch 1.0
+```
+
+なら、
+
+- 入力メッシュ：m
+- 内部計算：mm
+- voxel pitch：1 mm
+- QC用PLY座標：m
+- spill level：m
+- 主たる容量表示：m³
+- 参考表示：L / mL
+
+となります。
+
+### 容積の単位について
+
+長さの単位がmなら、容積はmではなく**m³**です。
+
+同様に、
+
+```text
+入力 mm → 主容量 mm³
+入力 cm → 主容量 cm³
+入力 m  → 主容量 m³
+```
+
+として出力します。
+
+L / mLも常に併記します。
+
+---
+
+# 6. 出力フォルダ
+
+v1では結果を入力ファイルと同じ階層へ直接ばらまきません。
+
+例えば、
+
+```text
+0015jinmen_small.ply
+```
+
+を実行すると、自動的に、
+
+```text
+0015jinmen_small_PotteryVolume_v1/
+```
+
+を作成します。
+
+1 mm計算の場合の例です。
+
+```text
+0015jinmen_small_PotteryVolume_v1/
+├── processed/
+│   └── 0015jinmen_small_pymeshlab_cleaned.ply
+│
+├── qa/
+│   ├── pymeshlab_before.json
+│   └── pymeshlab_after.json
+│
+└── pitch_1mm/
+    ├── result.json
+    ├── qa/
+    │   ├── trimesh_qa.json
+    │   └── voxel_qa.json
+    │
+    └── qc/
+        ├── fluid_surface.ply
+        ├── seed_point.ply
+        ├── spill_level_region.ply
+        └── ...
+```
+
+0.5 mmを追加実行すると、
+
+```text
+pitch_0p5mm/
+```
+
+が追加されます。
+
+このため、同じ資料について2 / 1 / 0.5 mmを比較してもファイルが混在しません。
+
+---
+
+# 7. Pythonを確認する
+
+このREADMEではPython 3.10以上を推奨します。
+
+## macOS
+
+「ターミナル」を開いて、
 
 ```bash
 python3 --version
 ```
 
-Python 3.10以上を推奨します。
+を実行します。
+
+例：
+
+```text
+Python 3.12.4
+```
+
+## Windows
+
+PowerShellで、
+
+```powershell
+py --version
+```
+
+を実行します。
 
 ---
 
-## 5.2 GitHubから取得する
+# 8. GitHubから取得する
 
-Gitを使ったことがなければ、GitHubのリポジトリ画面から、
+Gitを使ったことがない場合は、Gitコマンドを使う必要はありません。
 
-**Code → Download ZIP**
+GitHubのリポジトリ画面で、
 
-で取得して構いません。
+```text
+Code
+ ↓
+Download ZIP
+```
 
-ZIPを展開すると、少なくとも次の3ファイルがあります。
+を選択し、ZIPを展開します。
+
+最低限、
 
 ```text
 PotteryVolumeCalculator/
-├── vessel_voxel_volume.py
 ├── README.md
-└── requirements.txt
+├── requirements.txt
+└── vessel_voxel_volume.py
 ```
+
+があれば実行できます。
 
 ---
 
-## 5.3 ターミナルでフォルダを開く
+# 9. 仮想環境を作る
 
-macOSでは、ターミナルに
+Pythonライブラリをこのプログラム専用に分離するため、`.venv`を作ることを推奨します。
 
-```bash
-cd 
-```
+## macOS
 
-と入力し、`cd`の後に半角スペースを残した状態で、Finderからフォルダをターミナルへドラッグできます。
-
-Enterを押したあと、
-
-```bash
-ls
-```
-
-を実行し、
-
-```text
-vessel_voxel_volume.py
-README.md
-requirements.txt
-```
-
-が表示されれば準備できています。
-
----
-
-# 6. Pythonの仮想環境を作る
-
-ライブラリをこのプログラム専用に分けるため、仮想環境 `.venv` の使用を推奨します。
-
-最初に1回だけ、
+リポジトリのフォルダへ移動して、
 
 ```bash
 python3 -m venv .venv
 ```
 
-を実行します。
-
-続けて、
+続いて、
 
 ```bash
 source .venv/bin/activate
 ```
 
-を実行します。
+とします。
 
-成功するとターミナルの行頭に、
+行頭に、
 
 ```text
 (.venv)
 ```
 
-と表示されます。
+が表示されれば有効です。
 
-次回以降も、このフォルダで作業を始めるときは、
+## Windows
 
-```bash
-source .venv/bin/activate
+```powershell
+py -m venv .venv
 ```
 
-を実行してください。
+続いて、
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+です。
 
 ---
 
-# 7. 必要なPythonモジュールをインストールする
+# 10. 必要なPythonモジュール
 
-このプログラムでは次のライブラリを使用します。
+v1では次を使用します。
 
 - NumPy
 - SciPy
 - Trimesh
 - Pillow
+- PyMeshLab
 
-**推奨方法は `requirements.txt` を使う方法です。**
+### 一括インストール
 
-仮想環境 `(.venv)` が有効になっていることを確認して、
+仮想環境を有効にした状態で、
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -235,440 +391,58 @@ python3 -m pip install -r requirements.txt
 
 を実行してください。
 
-個別にインストールする場合は、
+Windowsで`python3`が使えない場合は、
 
-```bash
-python3 -m pip install numpy scipy trimesh Pillow
+```powershell
+py -m pip install -r requirements.txt
 ```
 
 です。
 
-## 重要：`PIL` と `Pillow`
+### 個別にインストールする場合
 
-エラーに、
+```bash
+python3 -m pip install numpy scipy trimesh Pillow pymeshlab
+```
+
+です。
+
+---
+
+## 11. `PIL`エラーについて
+
+次のエラーが出る場合があります。
 
 ```text
 No module named 'PIL'
 ```
 
-と表示されることがあります。
-
-この場合、インストールするパッケージ名は `PIL` ではなく **`Pillow`** です。
+この場合、インストールする名前は`PIL`ではありません。
 
 ```bash
 python3 -m pip install Pillow
-```
-
-を実行してください。
-
-## pipの更新通知について
-
-次のような表示はエラーではありません。
-
-```text
-[notice] A new release of pip is available
-```
-
-この通知が出ても、そのままプログラムを実行できます。
-
-pipの更新は任意です。
-
-```bash
-python3 -m pip install --upgrade pip
-```
-
----
-
-## 7.1 インストール確認
-
-次を実行してください。
-
-```bash
-python3 -c "import numpy, scipy, trimesh, PIL; print('modules OK')"
-```
-
-```text
-modules OK
-```
-
-と表示されれば準備完了です。
-
----
-
-# 8. プログラムのバージョンを確認する
-
-今回のコードは、以前の版との混同を避けるためバージョン番号を表示できます。
-
-```bash
-python3 vessel_voxel_volume.py --version
-```
-
-正しい版なら、
-
-```text
-vessel_voxel_volume.py 0.3.2
-```
-
-と表示されます。
-
-**実験開始前に必ずこの表示を確認することを推奨します。**
-
----
-
-# 9. まず1個体を1 mmで計測する
-
-土器ファイルを同じフォルダに置きます。
-
-```text
-PotteryVolumeCalculator/
-├── vessel_voxel_volume.py
-├── README.md
-├── requirements.txt
-└── pottery01.ply
-```
-
-入力がmm単位なら、
-
-```bash
-python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
-```
-
-入力がm単位なら、
-
-```bash
-python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 1.0
 ```
 
 です。
 
----
-
-# 10. プログラムが行う処理
-
-```text
-OBJ / PLY
-   ↓
-単位をmmへ統一
-   ↓
-メッシュQA
-   ├─ watertight
-   ├─ boundary edge
-   ├─ non-manifold edge
-   └─ degenerate face
-   ↓
-メッシュ全体をsurface voxel化
-   ↓
-器高10〜60%の範囲で内部空隙seedを探索
-   ↓
-高さ制限付き3D Flood Fill
-   ↓
-二分探索でspill levelを検出
-   ↓
-spill直前の液体領域を抽出
-   ↓
-voxel数 × voxel体積
-   ↓
-最大内容量 mL / L
-```
-
-内面だけを手作業で抽出する工程はありません。
+`Pillow`を入れるとPythonからは`PIL`という名前で読み込まれます。
 
 ---
 
-# 11. メッシュ検証（Mesh QA）
+## 12. PyMeshLabのインストールエラー
 
-容量計算の前に、メッシュの状態を表示します。
-
-例：
+PyMeshLabが入っていない場合は、
 
 ```text
-=== Mesh QA ===
-watertight          : False
-winding consistent  : True
-body count          : 1
-boundary edges      : 42
-non-manifold edges  : 0
-degenerate faces    : 0
-```
-
-## watertight
-
-理想的な土器メッシュでは、外面・口縁・内面・底部が連続し、メッシュとして閉じていることが望まれます。
-
-`False` の場合は、どこかに境界edgeや欠損がある可能性があります。
-
-ただし本プログラムは直ちに停止せず、その後のspill判定も試みます。
-
-## boundary edges
-
-1枚の三角形にしか共有されていないedgeです。
-
-0でない場合、次のQCファイルが作成されます。
-
-```text
-*_mesh_boundary_points.ply
-```
-
-CloudCompareで元メッシュと重ね、境界がどこにあるかを確認してください。
-
-## non-manifold edges
-
-3枚以上のfaceが共有しているedgeです。
-
-存在する場合、
-
-```text
-*_mesh_nonmanifold_points.ply
-```
-
-が作成されます。
-
----
-
-# 12. spill levelの検出
-
-このプログラムは、内部の液面を仮想的に上げていきます。
-
-実際には1層ずつすべて試すのではなく、二分探索を使って、
-
-```text
-漏れない高さ
-漏れる高さ
-```
-
-の境界を探します。
-
-例：
-
-```text
-safe level : index 149, Z=290.000 mm
-spill level: index 150, Z=292.000 mm
-```
-
-この場合、
-
-```text
-290 mm < 実際の流出高 <= 292 mm
-```
-
-という2 mm voxelでの離散化範囲になります。
-
-1 mm voxelなら、この高さ方向の区間は約1 mmになります。
-
----
-
-# 13. 容量の表示
-
-正常に終了すると、
-
-```text
-=== Maximum retained volume ===
-fluid voxels : ...
-volume       : ... mm^3
-volume       : ... mL
-volume       : ... L
+No module named 'pymeshlab'
 ```
 
 と表示されます。
 
-研究上は `mL` または `L` を使用すると分かりやすいでしょう。
-
----
-
-# 14. 出力ファイル
-
-1 mmで計算した場合、次のようなファイルが生成されます。
-
-```text
-pottery01_voxel_1mm_mesh_qa.json
-pottery01_voxel_1mm_result.json
-pottery01_voxel_1mm_fluid_surface.ply
-pottery01_voxel_1mm_spill_level_region.ply
-pottery01_voxel_1mm_seed_point.ply
-```
-
-メッシュに問題がある場合はさらに、
-
-```text
-pottery01_voxel_1mm_mesh_boundary_points.ply
-pottery01_voxel_1mm_mesh_nonmanifold_points.ply
-```
-
-が作成されます。
-
-## `*_mesh_qa.json`
-
-容量計算が途中で失敗しても残るメッシュ検証結果です。
-
-## `*_result.json`
-
-容量計算が正常終了した場合の全結果です。
-
-## `*_fluid_surface.ply`
-
-spill直前まで液体が占めると判定された内部領域の表面です。
-
-## `*_spill_level_region.ply`
-
-spill levelで内部と外部がつながった領域を確認するためのQCデータです。
-
-## `*_seed_point.ply`
-
-内部空隙の探索に使用したseed位置です。
-
----
-
-# 15. CloudCompareで必ずQCする
-
-最初の実験では数値だけを採用せず、CloudCompareで確認してください。
-
-少なくとも、
-
-1. 元の土器メッシュ
-2. `*_fluid_surface.ply`
-3. `*_spill_level_region.ply`
-4. `*_mesh_boundary_points.ply`（存在する場合）
-
-を重ねます。
-
-### 正常と考えられる状態
-
-- `fluid_surface` が土器内部に収まる
-- spill levelが口縁付近にある
-- spill領域が最も低い口縁付近から外へつながる
-- boundary pointsが存在しない、または容量に影響しない位置だと確認できる
-
-### 要注意
-
-- spill levelが胴部中央や底部付近
-- boundary pointsが胴部内外面を貫く穴の周囲に集中
-- fluid surfaceが器外へ漏れる
-- seed pointが器壁の中や器外にある
-
----
-
-# 16. 自動QCのspill ratio
-
-プログラムは、spill levelが器高のどの位置にあるかを、
-
-```text
-spill ratio: 0.93 of mesh height
-```
-
-のように表示します。
-
-現在の単純器形向け設定では、上部25%以内、すなわち、
-
-```text
-spill ratio >= 0.75
-```
-
-なら口縁由来として比較的妥当な可能性が高い、という**簡易的な警告基準**を使っています。
-
-これは判定の保証ではありません。最終判断はCloudCompareで行ってください。
-
----
-
-# 17. メッシュに穴がある場合
-
-内部seedの高さですでに外部へ漏れている場合、次のようなエラーになります。
-
-```text
-内部seedの高さですでに外部へ漏れています。
-口縁より低い位置にメッシュ穴がある可能性が高いです。
-```
-
-この場合、容量値は出力しません。
-
-まず、
-
-```text
-*_mesh_boundary_points.ply
-*_mesh_qa.json
-```
-
-を確認してください。
-
-この仕様は、メッシュ欠損による誤った小容量を、正常な計測値として採用しないためのものです。
-
----
-
-# 18. 2 mm / 1 mm / 0.5 mmを比較する
-
-ボクセル法では解像度によって容量が変化します。
-
-まず1 mmを標準的な実験値とし、可能なら次の3条件を比較してください。
+次を実行します。
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 2.0
-python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
-python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 0.5
-```
-
-例：
-
-| voxel size | volume |
-|---:|---:|
-| 2.0 mm | 5,420 mL |
-| 1.0 mm | 5,470 mL |
-| 0.5 mm | 5,492 mL |
-
-解像度を細かくしたときに値が収束するかを確認します。
-
----
-
-# 19. なぜ解像度で容量が変わるのか
-
-元の三角形メッシュ表面には数学的な厚さはありません。
-
-しかしボクセル化すると、表面が一定の厚さを持つ格子として表現されます。
-
-```text
-実際の面
-────────────
-
-voxel化した境界
-████████████
-```
-
-そのため、内部空間がわずかに小さく評価される場合があります。
-
-この影響を確認するため、複数pitchで計測します。
-
----
-
-# 20. 計算時間とメモリ
-
-1 mm voxelでは、一般的な数十cm程度の土器なら通常のノートPCでも現実的な規模です。
-
-ただし計算時間は、
-
-- 土器の大きさ
-- face数
-- voxel pitch
-
-に依存します。
-
-特に、
-
-```text
-Surface voxelization
-```
-
-が最も時間を使うことがあります。
-
-0.5 mmでは各方向の格子数がおおむね2倍になるため、3D格子全体は最大で約8倍になります。
-
-まず1 mmで動作確認してから0.5 mmを試してください。
-
----
-
-# 21. よくあるエラー
-
-## `No module named 'PIL'`
-
-```bash
-python3 -m pip install Pillow
+python3 -m pip install pymeshlab
 ```
 
 または、
@@ -677,170 +451,394 @@ python3 -m pip install Pillow
 python3 -m pip install -r requirements.txt
 ```
 
-を実行してください。
+をもう一度実行してください。
+
+PyMeshLabは64-bit Python環境を前提としています。
 
 ---
 
-## `No module named 'trimesh'`
+# 13. バージョン確認
 
-```bash
-python3 -m pip install trimesh
-```
-
----
-
-## `No module named 'scipy'`
-
-```bash
-python3 -m pip install scipy
-```
-
----
-
-## `unrecognized arguments: --unit`
-
-古いバージョンのスクリプトを実行している可能性があります。
+ダウンロードしたファイルが正しいか確認するため、
 
 ```bash
 python3 vessel_voxel_volume.py --version
 ```
 
-を実行し、
+を実行してください。
+
+v1なら、
 
 ```text
-0.3.2
+vessel_voxel_volume.py 1.0.0
 ```
 
-であることを確認してください。
+と表示されます。
 
 ---
 
-## spill levelが異常に低い
+# 14. 最初の実行
 
-メッシュに穴がある可能性があります。
-
-CloudCompareで、
-
-```text
-*_mesh_boundary_points.ply
-*_spill_level_region.ply
-```
-
-を確認してください。
-
----
-
-## 最上部まで行っても外へ漏れない
-
-voxel化の結果、口部が閉じてしまった可能性があります。
-
-まずpitchを細かくしてください。
+入力ファイルがmmなら、
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 0.5
-```
-
----
-
-# 22. 主なオプション
-
-全オプションは、
-
-```bash
-python3 vessel_voxel_volume.py --help
-```
-
-で確認できます。
-
-### `--unit`
-
-```text
-mm / cm / m
-```
-
-入力メッシュの単位。
-
-### `--pitch`
-
-```text
-1.0
-```
-
-voxelの1辺。単位はmm。
-
-### `--min-cavity-area`
-
-内部seed候補として認める最小断面積。通常は変更不要です。
-
-### `--seed-min-fraction` / `--seed-max-fraction`
-
-内部seedを探す器高範囲です。
-
-既定値は、
-
-```text
-0.10 ～ 0.60
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
 ```
 
 です。
 
-底部の陶胎内部を誤ってseedにしないため、底面直上ではなく器高の途中から探索します。
+mなら、
 
-### `--no-qc`
+```bash
+python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 1.0
+```
 
-QC用PLYを出力しません。
+です。
 
-通常は使用しないことを推奨します。
+`--pitch`は入力単位に関係なく**常にmm**です。
+
+したがって、
+
+```bash
+--unit m --pitch 1.0
+```
+
+は、
+
+> m単位の入力メッシュを内部でmmに変換し、1 mmボクセルで計算する
+
+という意味です。
 
 ---
 
-# 23. 推奨する最初の実験
+# 15. 実行時の3段階QA
 
-1. 単純な完形土器を1個体選ぶ
-2. CloudCompareでZ軸に直立させる
-3. 単位を確認する
-4. PLYで保存する
-5. `--pitch 1.0` で計算する
-6. Mesh QAを見る
-7. CloudCompareでfluid / spill / boundaryを確認する
-8. 問題がなければ2 mmと0.5 mmでも計測する
-9. 3解像度の値を比較する
-10. 既知容量の容器などでも検証する
+## Stage A: PyMeshLab
+
+```text
+=== Stage A: PyMeshLab QA / preprocessing ===
+```
+
+MeshLab系のトポロジー判定を行います。
+
+特に、
+
+```text
+boundary edges
+components
+2-manifold
+non-2-manifold edges
+```
+
+を確認します。
+
+PyMeshLab処理後のPLYも、
+
+```text
+processed/
+```
+
+に保存されます。
+
+このファイルは**入力と同じ座標単位**です。
+
+## Stage B: Trimesh
+
+```text
+=== Stage B: Trimesh QA ===
+```
+
+実際にvoxelizerへ渡すメッシュをTrimesh側でも検証します。
+
+PyMeshLabとTrimeshで数値が違う場合、それ自体が重要なQA情報です。
+
+## Stage C: Voxel
+
+```text
+=== Stage C: Surface voxelization ===
+```
+
+実際にFlood Fillが障壁として使用するsurface voxelを作ります。
+
+ここで、
+
+```text
+components : 6=..., 18=..., 26=...
+```
+
+も記録します。
+
+元メッシュが閉じていても、voxel化後の障壁に隙間が生じる可能性があります。
 
 ---
 
-# 24. 最短実行例（macOS）
+# 16. spill level
 
-Pythonがすでにインストールされている場合、リポジトリのフォルダで順に実行します。
+プログラムは土器内部の液面を低い位置から上げていき、
+
+> 初めて外部へ通じる高さ
+
+を探索します。
+
+例：
+
+```text
+safe level : 0.201 m
+spill level: 0.202 m
+```
+
+なら、
+
+```text
+0.201 m < 実際のspill高さ <= 0.202 m
+```
+
+という意味です。
+
+1 mm voxelなら、高さ方向の分解能も基本的に1 mmです。
+
+---
+
+# 17. 結果
+
+m単位入力の場合は例えば、
+
+```text
+=== Maximum retained liquid volume ===
+volume : 0.00549 m^3
+volume : 5.49 L
+volume : 5490.000000 mL
+```
+
+のように表示します。
+
+m入力なら、QC用PLYの座標もmです。
+
+---
+
+# 18. CloudCompareによるQC
+
+`qc/`内のPLYを元メッシュと一緒にCloudCompareで読み込みます。
+
+通常確認するファイルは、
+
+```text
+fluid_surface.ply
+spill_level_region.ply
+seed_point.ply
+```
+
+です。
+
+### fluid_surface.ply
+
+プログラムが液体空間と判定した領域の表面です。
+
+- 土器内面に沿っている
+- 器壁外へ漏れていない
+- 底からspill levelまで連続している
+
+ことを確認します。
+
+### spill_level_region.ply
+
+最初に外部と接続した高さ付近です。
+
+正常なら、単純器形では口縁の低い部分付近に現れるはずです。
+
+### seed_point.ply
+
+内部領域のFlood Fill開始点です。
+
+土器内部にあることを確認します。
+
+---
+
+# 19. spill levelが低すぎる場合
+
+例えば土器高が230 mm程度なのに、
+
+```text
+spill level = 27 mm
+```
+
+となる場合、正常な口縁流出とは考えにくいため警告します。
+
+このとき自動的に、
+
+```text
+surface_voxels.ply
+spill_slab_surface.ply
+spill_slab_free.ply
+```
+
+も出力します。
+
+これをCloudCompareで表示すると、
+
+- 実メッシュに穴がある
+- voxel化によって1セル程度の隙間が生じた
+
+のどちらかを検討できます。
+
+---
+
+# 20. エラー時にも診断ファイルを残す
+
+spill探索中にエラーになった場合でも、
+
+```text
+surface_voxels_on_error.ply
+error.json
+voxel_qa.json
+```
+
+を出力します。
+
+したがって、単に、
+
+```text
+ERROR
+```
+
+で終了するのではなく、失敗原因を3Dで確認できます。
+
+---
+
+# 21. 複数解像度で比較する
+
+まず、
+
+```bash
+python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 2.0
+python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 1.0
+python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 0.5
+```
+
+の3条件を推奨します。
+
+結果は、
+
+```text
+pottery01_PotteryVolume_v1/
+├── pitch_2mm/
+├── pitch_1mm/
+└── pitch_0p5mm/
+```
+
+に分かれます。
+
+---
+
+# 22. `--debug-voxels`
+
+通常の計算が成功してもsurface voxel全体を確認したい場合は、
+
+```bash
+python3 vessel_voxel_volume.py pottery01.ply \
+  --unit m \
+  --pitch 1.0 \
+  --debug-voxels
+```
+
+とします。
+
+---
+
+# 23. 出力先を指定する
+
+既定では入力ファイルと同じ階層に、
+
+```text
+<stem>_PotteryVolume_v1/
+```
+
+を作ります。
+
+別の場所へ保存したい場合は、
+
+```bash
+python3 vessel_voxel_volume.py pottery01.ply \
+  --unit m \
+  --pitch 1.0 \
+  --output-dir results/pottery01
+```
+
+とします。
+
+---
+
+# 24. pipの更新通知
+
+実行時に、
+
+```text
+A new release of pip is available
+```
+
+と表示されても、このプログラムのエラーではありません。
+
+通常は無視して構いません。
+
+---
+
+# 25. 最短の実行手順（macOS）
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 python3 vessel_voxel_volume.py --version
-python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
-```
-
-m単位のPLYなら最後の行だけ、
-
-```bash
 python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 1.0
 ```
 
-にします。
+結果フォルダ内の、
+
+```text
+pitch_1mm/qc/
+```
+
+をCloudCompareで確認してください。
 
 ---
 
-# 25. 研究上の位置づけ
+# 26. 研究上の注意
 
-本プログラムは現段階では、土器内容量をボクセル法で取得するための**実験・検証用ツール**です。
+本ツールは現段階では実験・検証用です。
 
-研究成果として容量値を使用する場合は、少なくとも、
+容量値を研究成果として使用する前に、
 
-- CloudCompare等によるQC
-- 0.5 / 1 / 2 mmなど複数解像度比較
-- 既知容量の容器または単純幾何形状による精度検証
-- 使用したコードのversion記録
-- `*_result.json` と `*_mesh_qa.json` の保存
+1. 既知容量の容器で検証
+2. 2 / 1 / 0.5 mmで収束確認
+3. PyMeshLab / Trimesh / voxel QAを保存
+4. CloudCompareでspill位置を確認
 
-を推奨します。
+することを推奨します。
+
+特に重要なのは、
+
+> **元メッシュのトポロジーが正常であることと、voxel化後の障壁が閉じていることは別問題**
+
+という点です。
+
+---
+
+# 27. requirements.txt
+
+v1では以下を使用します。
+
+```text
+numpy>=1.26
+scipy>=1.11
+trimesh>=4.0,<6
+Pillow>=10
+pymeshlab>=2023.12
+```
+
+インストールは、
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+で行ってください。
