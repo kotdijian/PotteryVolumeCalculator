@@ -73,11 +73,37 @@ OBJ / PLY メッシュ
 
 ### 単位
 
-**座標単位を mm（ミリメートル）にしてください。**
+入力メッシュは **mm / cm / m のいずれでも使用できます**。
 
-たとえば高さ30 cmの土器なら、メッシュの高さが約 `300` になる状態です。
+スクリプト内部では、読み込み直後に座標をmmへ変換してから計算します。入力ファイルそのものを書き換える必要はありません。
 
-高さが `0.30` になっている場合は、単位がメートルの可能性があります。そのまま実行しないでください。
+実行時に `--unit` で入力メッシュの単位を指定します。
+
+```bash
+# mm単位のメッシュ
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
+
+# cm単位のメッシュ
+python3 vessel_voxel_volume.py pottery01.ply --unit cm --pitch 1.0
+
+# m単位のメッシュ
+python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 1.0
+```
+
+`--unit` を省略した場合は `mm` として扱います。
+
+たとえば高さ30 cmの土器なら、
+
+- mm単位のデータでは高さがおよそ `300`
+- cm単位のデータでは高さがおよそ `30`
+- m単位のデータでは高さがおよそ `0.30`
+
+になります。
+
+**単位は自動推定しません。** 小型・大型資料で誤判定する可能性があるため、入力データの単位を確認して明示的に指定してください。
+
+なお、`--pitch` は入力メッシュの単位に関係なく **mm単位**です。  
+たとえば `--unit m --pitch 1.0` は、「m単位のメッシュを内部でmmへ変換し、1 mmボクセルで計算する」という意味です。
 
 ### 姿勢
 
@@ -103,7 +129,7 @@ OBJ / PLY メッシュ
 CloudCompareを使う場合は、実行前に次の3点を確認してください。
 
 1. 土器がZ軸方向に直立している
-2. メッシュの大きさがmm単位になっている
+2. メッシュの座標単位が mm / cm / m のどれか確認できている
 3. 大きな穴や欠損がない
 
 必要ならCloudCompareで回転・移動してから、PLYとして書き出します。
@@ -312,19 +338,19 @@ pottery01.ply
 ## macOS
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.ply --pitch 1.0
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
 ```
 
 ## Windows
 
 ```powershell
-py vessel_voxel_volume.py pottery01.ply --pitch 1.0
+py vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
 ```
 
 OBJの場合は、
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.obj --pitch 1.0
+python3 vessel_voxel_volume.py pottery01.obj --unit mm --pitch 1.0
 ```
 
 とします。
@@ -338,6 +364,8 @@ python3 vessel_voxel_volume.py pottery01.obj --pitch 1.0
 ```text
 === Input mesh ===
 file       : pottery01.ply
+input unit : mm
+scale      : x1 -> mm
 vertices   : ...
 faces      : ...
 watertight : ...
@@ -460,19 +488,19 @@ CloudCompareに、
 ## 2 mm
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.ply --pitch 2.0
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 2.0
 ```
 
 ## 1 mm
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.ply --pitch 1.0
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
 ```
 
 ## 0.5 mm
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.ply --pitch 0.5
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 0.5
 ```
 
 例えば、
@@ -520,7 +548,7 @@ python3 vessel_voxel_volume.py pottery01.ply --pitch 0.5
 たとえば口縁がおよそ `287.5 mm` の高さなら、
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.ply --pitch 1.0 --cap-z 287.5
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0 --cap-z 287.5
 ```
 
 とします。
@@ -591,7 +619,7 @@ ls
 
 - 土器がZ軸に直立していない
 - 口縁付近のメッシュが欠損している
-- 単位がmmではない
+- `--unit` の指定が実データの単位と合っていない
 - 口縁形状が現在の自動検出条件より複雑
 
 などです。
@@ -623,7 +651,33 @@ ls
 
 # 19. 主なオプション
 
-通常は `--pitch` だけで実行できます。
+通常は `--unit` と `--pitch` を確認すれば実行できます。
+
+```text
+--unit
+```
+
+入力メッシュの座標単位を指定します。
+
+指定できる値：
+
+```text
+mm
+cm
+m
+```
+
+既定値は `mm` です。
+
+例：
+
+```bash
+python3 vessel_voxel_volume.py pottery01.ply --unit m --pitch 1.0
+```
+
+この場合、m単位の入力座標を内部で1000倍してmmへ変換し、1 mmボクセルで計算します。
+
+---
 
 ```text
 --pitch
@@ -640,7 +694,7 @@ ls
 例：
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.ply --pitch 0.5
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 0.5
 ```
 
 ---
@@ -654,7 +708,7 @@ python3 vessel_voxel_volume.py pottery01.ply --pitch 0.5
 例：
 
 ```bash
-python3 vessel_voxel_volume.py pottery01.ply --cap-z 287.5
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --cap-z 287.5
 ```
 
 ---
@@ -685,7 +739,7 @@ python3 vessel_voxel_volume.py --help
 
 1. 比較的単純で完形に近い土器を1個体選ぶ
 2. CloudCompareでZ軸方向に直立させる
-3. 単位がmmであることを確認する
+3. 入力メッシュの単位（mm / cm / m）を確認する
 4. PLYとして保存する
 5. `--pitch 1.0` で実行する
 6. `cavity_surface.ply` と `cap.ply` をCloudCompareで確認する
@@ -759,7 +813,7 @@ macOSで、Pythonがすでにインストール済みなら、リポジトリの
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install numpy scipy trimesh
-python3 vessel_voxel_volume.py pottery01.ply --pitch 1.0
+python3 vessel_voxel_volume.py pottery01.ply --unit mm --pitch 1.0
 ```
 
 結果が出たら、CloudCompareで
