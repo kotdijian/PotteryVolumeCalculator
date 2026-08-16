@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PotteryVolumeCalculator
-Version 1.2.0
+Version 1.3.0
 
 OBJ / PLY の土器メッシュから、内面を明示的に抽出せず、
 「液体が最初に外へ溢れ出す直前までの最大内容量」を voxel 法で推定する。
@@ -52,7 +52,7 @@ from contextlib import redirect_stdout
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 # ----------------------------------------------------------------------
@@ -414,13 +414,13 @@ def export_boundary_comparison(archaeological_dir, raw_stats, cleaned_stats,
     cleaned_edges = int(cleaned_stats.get("boundary_edges", 0))
     comparison = {
         "raw_boundary_edges": raw_edges,
-        "after_duplicate_removal_boundary_edges": cleaned_edges,
+        "after_exact_weld_boundary_edges": cleaned_edges,
         "boundary_edges_removed": raw_edges - cleaned_edges,
         "boundary_edges_remaining_fraction": (
             cleaned_edges / raw_edges if raw_edges else None
         ),
         "raw_connected_components": raw_stats.get("component_count"),
-        "after_duplicate_removal_connected_components": cleaned_stats.get("component_count"),
+        "after_exact_weld_connected_components": cleaned_stats.get("component_count"),
         "vertices_removed_by_exact_weld": int(vertices_removed),
         "interpretation": (
             "Large reduction after exact-coordinate weld suggests topological seams at "
@@ -736,10 +736,14 @@ def pymeshlab_environment_report():
     if pymeshlab is None:
         return report
 
-    number_plugins = getattr(pymeshlab, "number_plugins", None)
-    if callable(number_plugins):
+    plugin_number = getattr(pymeshlab, "plugin_number", None)
+    if not callable(plugin_number):
+        # Compatibility fallback for older PyMeshLab releases.
+        plugin_number = getattr(pymeshlab, "number_plugins", None)
+
+    if callable(plugin_number):
         try:
-            report["plugins_loaded"] = int(number_plugins())
+            report["plugins_loaded"] = int(plugin_number())
         except Exception as exc:
             report["plugins_loaded_error"] = repr(exc)
 
@@ -1289,56 +1293,103 @@ def central_opening_at_slice(
     return best
 
 
-def find_interior_seed(
-    surface: np.ndarray,
-    center_xy: tuple[int, int],
+def boundary_seed_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return all free cells on the six outer faces as flood-fill seeds.
+    """
+    seed = np.zeros_like(mask, dtype=bool)
+    seed[0, :, :] = mask[0, :, :]
+    seed[-1, :, :] = mask[-1, :, :]
+    seed[:, 0, :] |= mask[:, 0, :]
+    seed[:, -1, :] |= mask[:, -1, :]
+    seed[:, :, 0] |= mask[:, :, 0]
+    seed[:, :, -1] |= mask[:, :, -1]
+    return seed
+
+
+def full_exterior_component(free: np.ndarray) -> np.ndarray:
+    """
+    Free-space component connected to the padded grid exterior when no
+    water-level restriction is imposed.
+
+    A valid vessel-cavity seed MUST belong to this component because the
+    vessel cavity must eventually connect to outside through the mouth.
+
+    Closed free volumes between inner/outer vessel surfaces do NOT belong
+    to this component and are therefore rejected as seeds.
+    """
+    exterior_seed = boundary_seed_mask(free)
+    return ndimage.binary_propagation(
+        exterior_seed,
+        structure=ndimage.generate_binary_structure(3, 1),
+        mask=free,
+    )
+
+
+def enclosed_free_components_2d(
+    free_slice: np.ndarray,
     min_area_voxels: int,
-    persistence: int,
-    close_iterations: int,
-    z_start_fraction: float = 0.10,
-    z_end_fraction: float = 0.60,
 ):
     """
-    土器の底端そのものを避け、下部〜中部の範囲で内部seedを探索。
+    Find free-space components enclosed within an XY slice.
+
+    Components touching the XY slice boundary are ordinary exterior space
+    at that Z and are excluded.  This intentionally does not perform
+    morphological closing: seed selection must reflect the actual voxel
+    barrier used by the spill calculation.
     """
-    nz = surface.shape[2]
-    k0 = max(0, int(math.floor(nz * z_start_fraction)))
-    k1 = min(nz - persistence, int(math.ceil(nz * z_end_fraction)))
-
-    for k in range(k0, k1 + 1):
-        candidates = []
-        for offset in range(persistence):
-            kk = k + offset
-            result = central_opening_at_slice(
-                surface[:, :, kk],
-                center_xy=center_xy,
-                min_area_voxels=min_area_voxels,
-                close_iterations=close_iterations,
-            )
-            if result is None:
-                candidates = []
-                break
-            candidates.append(result)
-
-        if candidates:
-            mid = persistence // 2
-            seed_k = k + mid
-            opening, area = candidates[mid]
-            coords = np.argwhere(opening)
-            centroid = coords.mean(axis=0)
-            d2 = np.sum((coords - centroid) ** 2, axis=1)
-            seed_xy = coords[int(np.argmin(d2))]
-            seed_xyz = (int(seed_xy[0]), int(seed_xy[1]), int(seed_k))
-            return seed_xyz, int(area), (z_start_fraction, z_end_fraction)
-
-    raise RuntimeError(
-        "土器内部のseed空隙を自動検出できませんでした。\n"
-        "考えられる原因:\n"
-        "- 土器がZ軸に直立していない\n"
-        "- voxel pitchが粗すぎる\n"
-        "- 底〜胴部に大きな欠損がある\n"
-        "- 現在の単純器形条件から外れている"
+    labels, n_labels = ndimage.label(
+        free_slice,
+        structure=ndimage.generate_binary_structure(2, 1),
     )
+
+    if n_labels == 0:
+        return []
+
+    boundary_labels = np.unique(
+        np.concatenate([
+            labels[0, :],
+            labels[-1, :],
+            labels[:, 0],
+            labels[:, -1],
+        ])
+    )
+    boundary_set = set(int(v) for v in boundary_labels if int(v) != 0)
+
+    objects = ndimage.find_objects(labels)
+    components = []
+
+    for label_id, obj in enumerate(objects, start=1):
+        if obj is None or label_id in boundary_set:
+            continue
+
+        sub = labels[obj] == label_id
+        area = int(np.count_nonzero(sub))
+        if area < min_area_voxels:
+            continue
+
+        local_coords = np.argwhere(sub)
+        offsets = np.array([obj[0].start, obj[1].start], dtype=int)
+        coords = local_coords + offsets
+
+        centroid = coords.mean(axis=0)
+        d2 = np.sum((coords - centroid) ** 2, axis=1)
+        representative_xy = coords[int(np.argmin(d2))]
+
+        components.append({
+            "label": int(label_id),
+            "area": area,
+            "centroid_xy": (
+                float(centroid[0]),
+                float(centroid[1]),
+            ),
+            "representative_xy": (
+                int(representative_xy[0]),
+                int(representative_xy[1]),
+            ),
+        })
+
+    return components
 
 
 def touches_boundary(mask: np.ndarray) -> bool:
@@ -1357,6 +1408,12 @@ def propagate_below_level(
     seed_xyz: tuple[int, int, int],
     level_k: int,
 ):
+    """
+    Propagate from seed using only free voxels at Z <= level_k.
+
+    This represents space that liquid can occupy without its free surface
+    rising above level_k.
+    """
     if level_k < seed_xyz[2]:
         raise ValueError("level_k は seed の高さ以上である必要があります。")
 
@@ -1374,12 +1431,194 @@ def propagate_below_level(
     )
 
 
+def find_valid_cavity_seed(
+    surface: np.ndarray,
+    center_xy: tuple[int, int],
+    min_area_voxels: int,
+    primary_z_band: tuple[float, float] = (0.15, 0.70),
+    fallback_z_band: tuple[float, float] = (0.05, 0.85),
+    max_components_per_slice: int = 4,
+):
+    """
+    Find a physically valid seed for the vessel cavity.
+
+    A candidate must satisfy ALL of the following:
+
+    A. It is inside a 2-D enclosed free-space component at its Z slice.
+    B. It belongs to the full-height exterior-connected free component.
+       -> therefore it can eventually escape through the mouth.
+    C. With movement restricted to Z <= seed Z, it does NOT reach the
+       padded-grid exterior.
+       -> therefore it is below its spill level.
+
+    This rejects the important false-positive class created by surface
+    voxelization: free voxels inside the clay body between inner and outer
+    surfaces.  Those regions are enclosed even at full height and fail B.
+    """
+    free = ~surface
+
+    # One global full-height flood.  This is the key discriminator between
+    # the actual vessel cavity and sealed material-interior free volumes.
+    exterior_full = full_exterior_component(free)
+
+    nx, ny, nz = surface.shape
+    cx, cy = center_xy
+
+    diagnostics = {
+        "method": (
+            "2D enclosed candidate + full-height exterior connectivity "
+            "+ below-level non-leak validation"
+        ),
+        "primary_z_band": list(primary_z_band),
+        "fallback_z_band": list(fallback_z_band),
+        "min_area_voxels": int(min_area_voxels),
+        "full_exterior_voxels": int(np.count_nonzero(exterior_full)),
+        "slices_examined": 0,
+        "enclosed_components_examined": 0,
+        "rejected_not_full_exterior": 0,
+        "rejected_already_leaking": 0,
+        "validated_candidates": 0,
+        "candidate_records": [],
+        "chosen": None,
+    }
+
+    candidate_points = []
+
+    def scan_band(z_band):
+        k0 = max(1, int(math.floor(nz * z_band[0])))
+        k1 = min(nz - 2, int(math.ceil(nz * z_band[1])))
+
+        for k in range(k0, k1 + 1):
+            diagnostics["slices_examined"] += 1
+
+            components = enclosed_free_components_2d(
+                free[:, :, k],
+                min_area_voxels=min_area_voxels,
+            )
+            if not components:
+                continue
+
+            # Prefer large, centrally located components.
+            for comp in components:
+                dx = comp["centroid_xy"][0] - cx
+                dy = comp["centroid_xy"][1] - cy
+                comp["center_distance_vox"] = float(math.hypot(dx, dy))
+
+            components.sort(
+                key=lambda c: (-c["area"], c["center_distance_vox"])
+            )
+
+            for comp in components[:max_components_per_slice]:
+                diagnostics["enclosed_components_examined"] += 1
+                sx, sy = comp["representative_xy"]
+                seed_xyz = (int(sx), int(sy), int(k))
+                candidate_points.append(seed_xyz)
+
+                record = {
+                    "seed_index": [int(v) for v in seed_xyz],
+                    "slice_area_voxels": int(comp["area"]),
+                    "center_distance_vox": float(
+                        comp["center_distance_vox"]
+                    ),
+                    "full_height_exterior_connected": bool(
+                        exterior_full[seed_xyz]
+                    ),
+                }
+
+                if not exterior_full[seed_xyz]:
+                    diagnostics["rejected_not_full_exterior"] += 1
+                    record["accepted"] = False
+                    record["reject_reason"] = (
+                        "sealed free-space region; does not connect to "
+                        "outside even at full height"
+                    )
+                    if len(diagnostics["candidate_records"]) < 100:
+                        diagnostics["candidate_records"].append(record)
+                    continue
+
+                low_component = propagate_below_level(
+                    free,
+                    seed_xyz,
+                    k,
+                )
+                leaks_now = touches_boundary(low_component)
+                record["leaks_at_seed_level"] = bool(leaks_now)
+
+                if leaks_now:
+                    diagnostics["rejected_already_leaking"] += 1
+                    record["accepted"] = False
+                    record["reject_reason"] = (
+                        "already exterior-connected at candidate Z"
+                    )
+                    if len(diagnostics["candidate_records"]) < 100:
+                        diagnostics["candidate_records"].append(record)
+                    continue
+
+                diagnostics["validated_candidates"] += 1
+                record["accepted"] = True
+                record["safe_component_voxels_at_seed_level"] = int(
+                    np.count_nonzero(low_component)
+                )
+
+                if len(diagnostics["candidate_records"]) < 100:
+                    diagnostics["candidate_records"].append(record)
+
+                diagnostics["chosen"] = record
+                diagnostics["chosen_z_band"] = list(z_band)
+
+                return (
+                    seed_xyz,
+                    int(comp["area"]),
+                    z_band,
+                    exterior_full,
+                    diagnostics,
+                    candidate_points,
+                )
+
+        return None
+
+    result = scan_band(primary_z_band)
+    if result is None:
+        result = scan_band(fallback_z_band)
+
+    if result is not None:
+        return result
+
+    if diagnostics["rejected_not_full_exterior"] > 0:
+        reason = (
+            "2D断面内の候補空隙は見つかりましたが、すべて全高さでも"
+            "外部へ接続しない閉領域でした。器壁内部のfree voxelを"
+            "候補として検出しているか、口縁開口がvoxel化で閉じた"
+            "可能性があります。"
+        )
+    elif diagnostics["rejected_already_leaking"] > 0:
+        reason = (
+            "外部へ最終的に接続する候補はありますが、候補高さですでに"
+            "外へ漏れています。より低い位置の穴・欠損・voxel隙間が"
+            "存在する可能性があります。"
+        )
+    else:
+        reason = (
+            "十分な面積を持つ2D enclosed free-space候補を検出"
+            "できませんでした。Z軸姿勢、器形、voxel pitchを確認してください。"
+        )
+
+    raise RuntimeError(
+        "有効な土器内容空間seedを検出できませんでした。\n" + reason
+    )
+
+
 def find_spill_level(
     free: np.ndarray,
     seed_xyz: tuple[int, int, int],
+    exterior_full: np.ndarray | None = None,
 ):
     """
-    内部空隙が外部境界へ初めて接続する最小Z indexを二分探索。
+    Find the minimum Z index at which the validated vessel cavity can
+    reach the padded-grid exterior.
+
+    Binary search is valid because connectivity is monotonic when the
+    permitted maximum Z only increases.
     """
     seed_k = int(seed_xyz[2])
     top_k = free.shape[2] - 1
@@ -1387,27 +1626,39 @@ def find_spill_level(
 
     low_component = propagate_below_level(free, seed_xyz, seed_k)
     evaluations += 1
+
     if touches_boundary(low_component):
         raise RuntimeError(
-            "内部seedの高さですでに外部へ漏れています。\n"
-            "口縁より低い位置にメッシュ/voxel障壁の穴がある可能性があります。"
+            "内部seedの検証後にもseed高さで外部へ漏れています。"
+            "内部状態の不整合です。"
         )
 
-    high_component = propagate_below_level(free, seed_xyz, top_k)
-    evaluations += 1
-    if not touches_boundary(high_component):
-        raise RuntimeError(
-            "最上層まで許可しても内部空隙が外部へ接続しません。\n"
-            "voxel化によって口が閉じた可能性があります。pitchを小さくしてください。"
+    if exterior_full is not None:
+        if not bool(exterior_full[seed_xyz]):
+            raise RuntimeError(
+                "内部seedがfull-height exterior componentに属していません。"
+                "seed選択ロジックの内部エラーです。"
+            )
+    else:
+        high_component = propagate_below_level(
+            free,
+            seed_xyz,
+            top_k,
         )
+        evaluations += 1
+        if not touches_boundary(high_component):
+            raise RuntimeError(
+                "検証済みseedが全高さでも外部へ到達しません。"
+            )
 
     lo = seed_k   # leak=False
-    hi = top_k    # leak=True
+    hi = top_k    # leak=True, guaranteed by validated exterior connectivity
 
     while hi - lo > 1:
         mid = (lo + hi) // 2
         comp = propagate_below_level(free, seed_xyz, mid)
         evaluations += 1
+
         if touches_boundary(comp):
             hi = mid
         else:
@@ -1417,7 +1668,19 @@ def find_spill_level(
     spill_component = propagate_below_level(free, seed_xyz, hi)
     evaluations += 2
 
+    if touches_boundary(safe_component):
+        raise RuntimeError(
+            "binary search後のsafe componentが外部へ接続しています。"
+            "spill探索の単調性検証に失敗しました。"
+        )
+    if not touches_boundary(spill_component):
+        raise RuntimeError(
+            "binary search後のspill componentが外部へ接続していません。"
+            "spill探索の単調性検証に失敗しました。"
+        )
+
     return lo, hi, safe_component, spill_component, evaluations
+
 
 
 def voxel_connectivity_report(surface_raw: np.ndarray) -> dict:
@@ -1648,8 +1911,8 @@ def estimate_volume(
     print(f"padded grid: {surface.shape} = {total_cells:,} cells")
     print(f"bool/grid  : ~{total_cells / (1024**2):.1f} MiB per array")
 
-    # ---- Interior seed ----
-    print("\n=== Interior seed ===")
+    # ---- Validated vessel-cavity seed ----
+    print("\n=== Vessel cavity seed validation ===")
     center_idx = padded_world_to_index(vox, center_mm, pad)
     center_xy = (int(center_idx[0]), int(center_idx[1]))
     min_area_voxels = max(
@@ -1658,13 +1921,42 @@ def estimate_volume(
     )
 
     ts = time.perf_counter()
-    seed_xyz, seed_area, seed_band = find_interior_seed(
-        surface=surface,
-        center_xy=center_xy,
-        min_area_voxels=min_area_voxels,
-        persistence=seed_persistence,
-        close_iterations=close_iterations,
-    )
+    try:
+        (
+            seed_xyz,
+            seed_area,
+            seed_band,
+            exterior_full,
+            seed_diagnostics,
+            candidate_seed_indices,
+        ) = find_valid_cavity_seed(
+            surface=surface,
+            center_xy=center_xy,
+            min_area_voxels=min_area_voxels,
+        )
+    except Exception as exc:
+        # Export surface voxelization even if cavity seed detection fails.
+        surface_path = layout["qc"] / "surface_voxels_seed_error.ply"
+        export_surface_voxels_native(vox, surface_path, scale_to_mm)
+        voxel_qa["surface_voxels_seed_error_ply"] = str(surface_path)
+
+        error_report = {
+            "program_version": __version__,
+            "status": "error",
+            "stage": "vessel_cavity_seed_validation",
+            "error": str(exc),
+            "input": str(input_path),
+            "input_unit": unit,
+            "pitch_mm": pitch,
+            "output_directory": str(layout["base"]),
+            "preprocessing_qa": pml_report,
+            "trimesh_qa": tm_report,
+            "voxel_qa": voxel_qa,
+        }
+        write_json(layout["run"] / "error.json", error_report)
+        write_json(layout["run_qa"] / "voxel_qa.json", voxel_qa)
+        raise
+
     seed_time = time.perf_counter() - ts
 
     seed_mm = padded_indices_to_points_mm(
@@ -1674,13 +1966,41 @@ def estimate_volume(
     )[0]
     seed_native = seed_mm / scale_to_mm
 
-    print(f"search band: {seed_band[0]:.2f}-{seed_band[1]:.2f} of height")
+    voxel_qa["seed_diagnostics"] = seed_diagnostics
+
+    # Candidate seed QC point cloud
+    if candidate_seed_indices:
+        candidate_mask = np.zeros_like(surface, dtype=bool)
+        for candidate in candidate_seed_indices:
+            candidate_mask[tuple(candidate)] = True
+        candidate_path = layout["qc"] / "seed_candidates.ply"
+        export_mask_native(
+            vox,
+            candidate_mask,
+            pad,
+            candidate_path,
+            scale_to_mm,
+            surface_only=False,
+        )
+        voxel_qa["seed_candidates_ply"] = str(candidate_path)
+
+    print(
+        f"search band: {seed_band[0]:.2f}-{seed_band[1]:.2f} "
+        "of padded voxel height"
+    )
     print(f"seed index : {seed_xyz}")
     print(
         f"seed XYZ   : {seed_native[0]:.6g}, "
         f"{seed_native[1]:.6g}, {seed_native[2]:.6g} {unit}"
     )
     print(f"seed area  : {seed_area:,} voxels")
+    print(
+        "candidate rejection: "
+        f"sealed={seed_diagnostics['rejected_not_full_exterior']}, "
+        f"already-leaking={seed_diagnostics['rejected_already_leaking']}"
+    )
+    print("full-height exterior-connected: True")
+    print("below-seed-level exterior-connected: False")
     print(f"time       : {seed_time:.2f} s")
 
     # ---- Spill search ----
@@ -1692,6 +2012,7 @@ def estimate_volume(
         safe_k, spill_k, fluid, spill_component, evaluations = find_spill_level(
             free,
             seed_xyz,
+            exterior_full=exterior_full,
         )
     except Exception as exc:
         # Failure diagnostics: always export surface voxels.
@@ -1711,7 +2032,7 @@ def estimate_volume(
             "preprocessing_qa": pml_report,
             "archaeological_boundary_derivatives": {
                 "raw": archaeological["raw_boundary_stats"],
-                "after_duplicate_removal": archaeological["cleaned_boundary_stats"],
+                "after_exact_weld": archaeological["cleaned_boundary_stats"],
                 "comparison": archaeological["boundary_comparison"],
             },
             "trimesh_qa": tm_report,
@@ -1897,12 +2218,13 @@ def estimate_volume(
         "preprocessing_qa": pml_report,
         "archaeological_boundary_derivatives": {
             "raw": archaeological["raw_boundary_stats"],
-            "after_duplicate_removal": archaeological["cleaned_boundary_stats"],
+            "after_exact_weld": archaeological["cleaned_boundary_stats"],
             "comparison": archaeological["boundary_comparison"],
         },
         "trimesh_qa": tm_report,
         "voxel_qa": voxel_qa,
         "seed_index": [int(v) for v in seed_xyz],
+        "seed_validation": seed_diagnostics,
         "seed_xyz_native": [float(v) for v in seed_native],
         "seed_xyz_native_unit": unit,
         "safe_level_native": safe_z_native,
@@ -1936,6 +2258,372 @@ def estimate_volume(
     print(f"total time  : {total_time:.2f} s")
 
     return result
+
+
+# ----------------------------------------------------------------------
+# Multi-pitch validation suite
+# ----------------------------------------------------------------------
+
+STANDARD_VALIDATION_PITCHES_MM = (2.0, 1.0, 0.5)
+
+
+def validation_base_dir(
+    input_path: Path,
+    output_dir: Path | None,
+) -> Path:
+    if output_dir is not None:
+        return Path(output_dir)
+    return input_path.parent / f"{input_path.stem}_PotteryVolume_v1"
+
+
+def write_validation_csv(path: Path, rows: list[dict]) -> None:
+    fields = [
+        "status",
+        "pitch_mm",
+        "safe_level_mm",
+        "spill_level_mm",
+        "spill_fraction_of_mesh_height",
+        "volume_l",
+        "volume_ml",
+        "delta_from_coarser_l",
+        "delta_from_coarser_pct_of_current",
+        "total_time_s",
+        "result_json",
+        "error",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k) for k in fields})
+
+
+def build_validation_summary(
+    input_path: Path,
+    unit: str,
+    pitches: tuple[float, ...],
+    run_records: list[dict],
+    base_dir: Path,
+):
+    """
+    Build a transparent convergence summary.
+
+    No extrapolated value is treated as ground truth. Richardson-style
+    extrapolation is reported only as an optional diagnostic when the
+    standard 2/1/0.5 mm sequence completed successfully and the volume
+    changes have the same sign.
+    """
+    successful = [
+        r for r in run_records
+        if r.get("status") == "ok"
+    ]
+
+    # Delta relative to immediately preceding coarser successful run.
+    previous = None
+    for record in run_records:
+        if record.get("status") != "ok":
+            continue
+        if previous is not None:
+            delta = record["volume_l"] - previous["volume_l"]
+            record["delta_from_coarser_l"] = float(delta)
+            if record["volume_l"] != 0:
+                record["delta_from_coarser_pct_of_current"] = float(
+                    100.0 * delta / record["volume_l"]
+                )
+        previous = record
+
+    diagnostics = {
+        "all_requested_pitches_completed": bool(
+            len(successful) == len(pitches)
+        ),
+        "successful_pitch_count": int(len(successful)),
+        "requested_pitch_count": int(len(pitches)),
+        "volume_monotonic_with_refinement": None,
+        "finest_vs_next_coarser_difference_l": None,
+        "finest_vs_next_coarser_difference_percent_of_finest": None,
+        "spill_upper_range_mm": None,
+        "empirical_order_q": None,
+        "richardson_extrapolated_volume_l": None,
+        "finest_vs_extrapolated_difference_l": None,
+        "finest_vs_extrapolated_percent": None,
+        "extrapolation_note": (
+            "Diagnostic only. Assumes V(p)=V_inf+a*p^q and should not be "
+            "treated as the measured capacity."
+        ),
+    }
+
+    if len(successful) >= 2:
+        vols = [r["volume_l"] for r in successful]
+        # Requested validation sequence is coarse -> fine.
+        diffs = [
+            vols[i + 1] - vols[i]
+            for i in range(len(vols) - 1)
+        ]
+        diagnostics["volume_monotonic_with_refinement"] = bool(
+            all(d >= 0 for d in diffs) or all(d <= 0 for d in diffs)
+        )
+
+        finest = successful[-1]
+        next_coarser = successful[-2]
+        delta = finest["volume_l"] - next_coarser["volume_l"]
+        diagnostics["finest_vs_next_coarser_difference_l"] = float(delta)
+        if finest["volume_l"] != 0:
+            diagnostics[
+                "finest_vs_next_coarser_difference_percent_of_finest"
+            ] = float(100.0 * delta / finest["volume_l"])
+
+        spill_values = [
+            r["spill_level_mm"]
+            for r in successful
+            if r.get("spill_level_mm") is not None
+        ]
+        if spill_values:
+            diagnostics["spill_upper_range_mm"] = float(
+                max(spill_values) - min(spill_values)
+            )
+
+    # Empirical order / Richardson diagnostic only for exact standard sequence.
+    if (
+        len(successful) == 3
+        and tuple(float(r["pitch_mm"]) for r in successful)
+        == STANDARD_VALIDATION_PITCHES_MM
+    ):
+        v2 = successful[0]["volume_l"]
+        v1 = successful[1]["volume_l"]
+        v05 = successful[2]["volume_l"]
+        d_coarse = v1 - v2
+        d_fine = v05 - v1
+
+        if (
+            d_coarse != 0.0
+            and d_fine != 0.0
+            and d_coarse * d_fine > 0.0
+        ):
+            ratio = abs(d_coarse / d_fine)
+            if ratio > 0.0 and math.isfinite(ratio):
+                q = math.log(ratio, 2.0)
+                diagnostics["empirical_order_q"] = float(q)
+
+                denom = (2.0 ** q) - 1.0
+                if abs(denom) > 1e-12:
+                    v_inf = v05 + (v05 - v1) / denom
+                    diagnostics["richardson_extrapolated_volume_l"] = float(
+                        v_inf
+                    )
+                    diagnostics[
+                        "finest_vs_extrapolated_difference_l"
+                    ] = float(v_inf - v05)
+                    if v_inf != 0:
+                        diagnostics[
+                            "finest_vs_extrapolated_percent"
+                        ] = float(100.0 * (v_inf - v05) / v_inf)
+
+    summary = {
+        "program": "PotteryVolumeCalculator",
+        "program_version": __version__,
+        "mode": "validation",
+        "input": str(input_path),
+        "input_unit": unit,
+        "requested_pitches_mm": [float(p) for p in pitches],
+        "run_records": run_records,
+        "convergence_diagnostics": diagnostics,
+        "output_directory": str(base_dir),
+    }
+    return summary
+
+
+def print_validation_summary(summary: dict) -> None:
+    print("\n" + "=" * 64)
+    print("=== Multi-pitch validation summary ===")
+    print("=" * 64)
+
+    print(
+        f"{'pitch [mm]':>10}  {'spill [mm]':>12}  "
+        f"{'volume [L]':>12}  {'Δ vs coarse':>13}"
+    )
+
+    for r in summary["run_records"]:
+        if r.get("status") != "ok":
+            print(
+                f"{r['pitch_mm']:>10g}  {'ERROR':>12}  "
+                f"{'ERROR':>12}  {'-':>13}"
+            )
+            continue
+
+        delta = r.get("delta_from_coarser_l")
+        delta_text = "-" if delta is None else f"{delta:+.6f} L"
+        print(
+            f"{r['pitch_mm']:>10g}  "
+            f"{r['spill_level_mm']:>12.3f}  "
+            f"{r['volume_l']:>12.6f}  "
+            f"{delta_text:>13}"
+        )
+
+    d = summary["convergence_diagnostics"]
+    if d.get("finest_vs_next_coarser_difference_l") is not None:
+        print(
+            "\nfinest vs next coarser: "
+            f"{d['finest_vs_next_coarser_difference_l']:+.6f} L "
+            f"({d['finest_vs_next_coarser_difference_percent_of_finest']:+.3f}% "
+            "of finest)"
+        )
+
+    if d.get("spill_upper_range_mm") is not None:
+        print(
+            f"spill upper-level range: {d['spill_upper_range_mm']:.3f} mm"
+        )
+
+    if d.get("empirical_order_q") is not None:
+        print(
+            f"empirical convergence order q: "
+            f"{d['empirical_order_q']:.3f}"
+        )
+    if d.get("richardson_extrapolated_volume_l") is not None:
+        print(
+            "diagnostic extrapolated volume: "
+            f"{d['richardson_extrapolated_volume_l']:.6f} L"
+        )
+        print("  NOTE: diagnostic only; not the measured capacity.")
+
+
+def run_validation_suite(
+    input_path: Path,
+    unit: str,
+    pad: int,
+    min_cavity_area_mm2: float,
+    seed_persistence: int,
+    close_iterations: int,
+    output_dir: Path | None,
+    debug_voxels: bool,
+    boundary_sample_mm: float,
+    require_pymeshlab: bool,
+):
+    """
+    Detailed validation mode.
+
+    Runs 2.0, 1.0 and 0.5 mm as independent full pipelines.
+    This intentionally repeats preprocessing/QA for each pitch so that
+    every result is independently reproducible and carries its own QA.
+    """
+    pitches = STANDARD_VALIDATION_PITCHES_MM
+    base_dir = validation_base_dir(input_path, output_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"=== PotteryVolumeCalculator v{__version__} ===")
+    print("mode       : validation")
+    print("pitches mm : 2.0, 1.0, 0.5")
+    print(f"output dir : {base_dir}")
+    print(
+        "NOTE: each pitch is executed as an independent full pipeline "
+        "for detailed validation."
+    )
+
+    records = []
+    failures = []
+
+    for index, pitch in enumerate(pitches, start=1):
+        print("\n" + "#" * 72)
+        print(
+            f"### Validation run {index}/{len(pitches)} "
+            f"— pitch {pitch:g} mm"
+        )
+        print("#" * 72)
+
+        try:
+            result = estimate_volume(
+                input_path=input_path,
+                pitch=pitch,
+                unit=unit,
+                pad=pad,
+                min_cavity_area_mm2=min_cavity_area_mm2,
+                seed_persistence=seed_persistence,
+                close_iterations=close_iterations,
+                output_dir=base_dir,
+                debug_voxels=debug_voxels,
+                boundary_sample_mm=boundary_sample_mm,
+                require_pymeshlab=require_pymeshlab,
+            )
+
+            record = {
+                "status": "ok",
+                "pitch_mm": float(pitch),
+                "safe_level_mm": float(
+                    result["voxel_qa"]["safe_level_z_mm"]
+                ),
+                "spill_level_mm": float(
+                    result["voxel_qa"]["spill_level_z_mm"]
+                ),
+                "spill_fraction_of_mesh_height": float(
+                    result["spill_fraction_of_mesh_height"]
+                ),
+                "volume_l": float(result["volume_l"]),
+                "volume_ml": float(result["volume_ml"]),
+                "total_time_s": float(
+                    result["timing_seconds"]["total"]
+                ),
+                "result_json": str(
+                    base_dir / pitch_label(pitch) / "result.json"
+                ),
+                "error": None,
+            }
+            records.append(record)
+
+        except Exception as exc:
+            record = {
+                "status": "error",
+                "pitch_mm": float(pitch),
+                "safe_level_mm": None,
+                "spill_level_mm": None,
+                "spill_fraction_of_mesh_height": None,
+                "volume_l": None,
+                "volume_ml": None,
+                "total_time_s": None,
+                "result_json": None,
+                "error": str(exc),
+            }
+            records.append(record)
+            failures.append((pitch, str(exc)))
+
+            print(
+                f"\nVALIDATION RUN ERROR at pitch {pitch:g} mm: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                "Remaining pitches will still be attempted so that the "
+                "validation report is as complete as possible.",
+                file=sys.stderr,
+            )
+
+    summary = build_validation_summary(
+        input_path=input_path,
+        unit=unit,
+        pitches=pitches,
+        run_records=records,
+        base_dir=base_dir,
+    )
+
+    json_path = base_dir / "validation_summary.json"
+    csv_path = base_dir / "validation_summary.csv"
+    write_json(json_path, summary)
+    write_validation_csv(csv_path, records)
+
+    print_validation_summary(summary)
+    print(f"\nvalidation JSON: {json_path}")
+    print(f"validation CSV : {csv_path}")
+
+    if failures:
+        failed_text = ", ".join(
+            f"{pitch:g} mm" for pitch, _ in failures
+        )
+        raise RuntimeError(
+            "validation mode completed with failed pitch run(s): "
+            f"{failed_text}. See validation_summary.json and each pitch "
+            "folder for diagnostics."
+        )
+
+    return summary
+
 
 
 # ----------------------------------------------------------------------
@@ -1974,11 +2662,23 @@ def main():
         default="mm",
         help="入力メッシュの座標単位。既定値 mm",
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--pitch",
         type=float,
-        default=1.0,
-        help="voxel edge length [mm]。既定値 1.0",
+        default=None,
+        help=(
+            "single-pitch mode: voxel edge length [mm]。"
+            "大量資料処理向け。--validateを使わない場合の既定値は1.0"
+        ),
+    )
+    mode_group.add_argument(
+        "--validate",
+        action="store_true",
+        help=(
+            "multi-pitch validation mode: 2.0 / 1.0 / 0.5 mmを"
+            "独立した全工程として一括実行し、収束summaryを作成"
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -2005,15 +2705,15 @@ def main():
         "--seed-persist",
         type=int,
         default=3,
-        help="内部seed認定に必要な連続slice数。既定値 3",
+        help="互換性のため保持。v1.3.0のvalidated seed方式では使用しません。",
     )
     parser.add_argument(
         "--close-iters",
         type=int,
         default=1,
         help=(
-            "seed検出用2D断面だけに適用するclosing回数。"
-            "3Dメッシュ/voxel本体は修復しない。既定値 1"
+            "互換性のため保持。v1.3.0のvalidated seed方式では"
+            "morphological closingを使用しません。"
         ),
     )
     parser.add_argument(
@@ -2041,19 +2741,35 @@ def main():
         parser.error("input OBJ/PLY が必要です（--diagnose-env の場合を除く）")
 
     try:
-        estimate_volume(
-            input_path=args.input,
-            pitch=args.pitch,
-            unit=args.unit,
-            pad=args.pad,
-            min_cavity_area_mm2=args.min_cavity_area,
-            seed_persistence=args.seed_persist,
-            close_iterations=args.close_iters,
-            output_dir=args.output_dir,
-            debug_voxels=args.debug_voxels,
-            boundary_sample_mm=args.boundary_sample_mm,
-            require_pymeshlab=args.require_pymeshlab,
-        )
+        if args.validate:
+            run_validation_suite(
+                input_path=args.input,
+                unit=args.unit,
+                pad=args.pad,
+                min_cavity_area_mm2=args.min_cavity_area,
+                seed_persistence=args.seed_persist,
+                close_iterations=args.close_iters,
+                output_dir=args.output_dir,
+                debug_voxels=args.debug_voxels,
+                boundary_sample_mm=args.boundary_sample_mm,
+                require_pymeshlab=args.require_pymeshlab,
+            )
+        else:
+            pitch = 1.0 if args.pitch is None else args.pitch
+            print("mode       : single-pitch")
+            estimate_volume(
+                input_path=args.input,
+                pitch=pitch,
+                unit=args.unit,
+                pad=args.pad,
+                min_cavity_area_mm2=args.min_cavity_area,
+                seed_persistence=args.seed_persist,
+                close_iterations=args.close_iters,
+                output_dir=args.output_dir,
+                debug_voxels=args.debug_voxels,
+                boundary_sample_mm=args.boundary_sample_mm,
+                require_pymeshlab=args.require_pymeshlab,
+            )
     except ModuleNotFoundError as exc:
         dependency_error(exc)
     except Exception as exc:

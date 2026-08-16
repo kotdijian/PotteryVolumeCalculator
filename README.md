@@ -1,281 +1,335 @@
-# PotteryVolumeCalculator v1.2.0
+# PotteryVolumeCalculator v1.3.0
 
-PLY / OBJ 形式の土器3Dメッシュから、**液体が最初に外へ溢れ出す直前までの最大内容量**を voxel 法で推定する実験用ツールです。
+PLY / OBJ形式の土器3Dメッシュから、**液体が最初に外へ溢れ出す直前までの最大内容量**をvoxel法で推定する実験用ツールです。
 
-v1.2では、PyMeshLabのプラグインが環境によってロードされない場合でも容量計算を停止しないよう、前処理とQAの基準を **NumPy + Trimesh** に変更しました。PyMeshLabは独立したcross-checkとして残しています。
+v1.3では、用途に応じて次の2モードを並列実装しました。
 
----
+## このプログラムに適した3Dモデル
 
-## 1. v1.2の重要な変更
+PotteryVolumeCalculatorは、土器3Dモデルの形状から、**液体を保持できる最大容量**をvoxel法で推定するプログラムです。主として、以下のような資料を対象とします。
 
-v1.1までの実装では、PyMeshLabのフィルタが使えることを前提としていたため、環境によって次のエラーが起きました。
+- **完形土器・ほぼ完形の土器**  
+  底部から口縁までの器形が連続して残るモデルでは、液体が最初に外部へ流出する直前までの最大容量を算出します。
 
-```text
-Unknown format for load: ply
-Filter does not exists: get_topological_measures
-```
+- **底部から上方へ連続した形状が残る残存土器**  
+  口縁まで残っていない資料でも、底部から連続して液体を保持できる形状が残っていれば、**現存する形状で液体を保持できる上限までの容量**を算出できます。したがって、この値は本来の完形時容量ではなく、残存部分の保持容量です。
 
-v1.2では、
+- **接合復元された土器**  
+  接合面で頂点が完全に一致している場合は、計算用メッシュ上でそれらを統合して処理します。一方、実際に幾何学的な隙間や欠損が残っている場合、それらは液体の流出経路として扱われます。小さな隙間はvoxel pitchとの関係によって計算上閉じる場合がありますが、**一定サイズ以下の隙間を自動的に穴埋めする機能ではありません**。
 
-```text
-PLY / OBJ
-  ↓
-Trimeshで読込（process=False）
-  ↓
-raw fragment boundary候補を保存
-  ↓
-NumPyで完全同一座標の頂点だけをweld
-  ↓
-NumPy + Trimeshで基準トポロジーQA
-  │
-  ├── PyMeshLabが正常なら独立cross-check
-  │     ※計算メッシュには使用しない
-  ↓
-surface voxelization
-  ↓
-spill-level探索
-  ↓
-最大保持液量
-```
+- **欠損や開口部のある土器**  
+  器壁に大きな欠損や穴がある場合、その位置から液体が流出するため、通常は**その開口部の高さまでに保持できる容量**が算出されます。欠損が大きく、内部空間を安定して検出できない場合には計算を完了できないことがあります。本来の器形に近い容量を求める場合は、必要に応じて計算前にモデルを複製し、欠損部を適切に補完してください。補完した場合は、その処理内容を記録しておくことを推奨します。
 
-としました。
+### 本プログラムの対象外となる資料
 
-**PyMeshLabのプラグインが欠けていても、通常の容量計算は継続します。**
+底部や器壁が大きく失われ、**断片的に接合された破片から本来の完形時容量を推定する用途**には、本プログラムは適していません。
+
+このような資料については、残存する縦断面形状から器形を推定し、**回転体として復元した形状から容量を算出する別方式**を開発中です。
 
 ---
 
-## 2. 容量の定義
 
-容量は、
+# 初めてPython・CLIを使う方へ
 
-> 土器を+Z方向に直立させた状態で、液体が最初に外部へ流出する直前まで保持できる最大内容量
+このプログラムは、**ターミナル（Terminal）からコマンドを入力して実行するCLI（Command Line Interface）プログラム**です。専用のGUIアプリを開くのではなく、Pythonに「どのファイルを、どの設定で処理するか」を文字で指定します。
 
-と定義します。
+初めて使う場合は、以下の手順を順番に実行してください。
 
-水平capは使用しません。非水平口縁でも、内部空間が外部へ最初につながるspill levelを3D flood fillで探索します。
+## 0. 用語
 
----
-
-## 3. 自動前処理
-
-容量計算用コピーに対して自動実行するのは次だけです。
-
-1. faceから参照されていない頂点を除去
-2. XYZ座標が**完全に同一**の頂点だけを統合
-
-重要な条件：
-
-```text
-coordinate tolerance : 0
-vertex movement      : なし
-face追加・削除        : なし
-```
-
-処理前後で、参照頂点がまったく同じXYZへ対応していることをコード内部で確認します。
-
-```text
-geometry preserved : True
-```
-
-でなければ計算を停止します。
-
-### 自動実行しない処理
-
-以下は形状・トポロジーを変更し得るため行いません。
-
-- Close Holes
-- Merge Close Vertices
-- Snap Mismatched Borders
-- Repair non-manifold edges
-- Repair non-manifold vertices
+- **ターミナル**：文字でコマンドを入力するアプリです。macOSでは「ターミナル」を使用できます。
+- **CLI**：ターミナルからコマンドを入力して操作する方法です。
+- **ワーキングディレクトリ（作業ディレクトリ）**：現在ターミナルが作業対象としているフォルダです。
+- **Python**：`vessel_voxel_volume.py`を実行するためのプログラムです。
+- **仮想環境（venv）**：このプログラム専用のPython環境です。他のPythonプログラムとの依存関係の衝突を避けるため、利用を推奨します。
 
 ---
 
-## 4. 破片境界候補を別データとして保存
+## 1. GitHubからプログラムをダウンロードする
 
-raw meshのboundary edgeは、容量計算用QAとは別に、復元土器から実際の破片位置・サイズを再抽出するための派生データとして保存します。
+GitHubのPotteryVolumeCalculatorリポジトリを開き、
 
 ```text
-<model>_PotteryVolume_v1/
-└── archaeological/
-    ├── raw_boundary_vertices.ply
-    ├── raw_boundaries_sampled.ply
-    ├── raw_boundary_stats.json
-    ├── raw_components.csv
-    ├── raw_components.json
-    ├── raw_components_colored.ply
-    ├── after_exact_weld_boundary_vertices.ply
-    ├── after_exact_weld_boundaries_sampled.ply
-    ├── after_exact_weld_components.csv
-    └── boundary_before_after_comparison.json
+Code → Download ZIP
 ```
 
-`raw_*`はcleaning前なので、元モデルに含まれる接合線情報を保持します。
+を選択してダウンロードし、ZIPファイルを展開します。
 
-connected componentは「破片候補」であり、自動的に考古学的な実破片と断定するものではありません。
+Gitを利用している場合は`git clone`でも構いませんが、初めて利用する場合はZIPダウンロードで問題ありません。
+
+展開したフォルダには、少なくとも次のファイルが含まれます。
+
+```text
+PotteryVolumeCalculator/
+├── vessel_voxel_volume.py
+├── README.md
+├── requirements.txt
+└── requirements-core.txt
+```
 
 ---
 
-## 5. PyMeshLabの位置づけ
+## 2. ターミナルを開く
 
-PyMeshLabは**独立cross-check**です。
-
-プログラムは起動時に、対象フィルタが本当にロードされているかを確認します。
-
-対象：
+macOSでは、
 
 ```text
-get_topological_measures
-meshing_remove_duplicate_vertices
-meshing_remove_unreferenced_vertices
+アプリケーション → ユーティリティ → ターミナル
 ```
 
-`apply_filter()`メソッドが存在するだけでは利用可能とは判定しません。
+から起動できます。
 
-ロード済みフィルタ一覧または実在する生成メソッドで確認できた場合だけ呼び出します。
+以降のコマンドはターミナルへ入力します。
 
-PyMeshLabが利用不能なら、
+---
 
-```text
-cross-check status: plugins_or_required_filters_unavailable
-used for calculation mesh: False
-```
+## 3. ダウンロードしたフォルダをワーキングディレクトリにする
 
-などと記録し、計算を続けます。
-
-PyMeshLabを必須条件として実行したい場合だけ、
+例えばDownloadsフォルダへ展開した場合：
 
 ```bash
---require-pymeshlab
+cd ~/Downloads/PotteryVolumeCalculator
 ```
 
-を指定します。
+Documents/GitHub以下に置いた場合：
+
+```bash
+cd ~/Documents/GitHub/PotteryVolumeCalculator
+```
+
+### 現在の場所を確認する
+
+```bash
+pwd
+```
+
+### 現在のフォルダにあるファイルを確認する
+
+```bash
+ls
+```
+
+ここで、
+
+```text
+vessel_voxel_volume.py
+README.md
+requirements.txt
+```
+
+などが表示されれば準備できています。
+
+### フォルダ名に空白がある場合
+
+パス全体を引用符で囲みます。
+
+```bash
+cd "~/Documents/My Pottery Project"
+```
+
+ただし、`~`を引用符内に入れると展開されないシェルもあるため、より確実なのは次のように空白だけをエスケープする方法です。
+
+```bash
+cd ~/Documents/My\ Pottery\ Project
+```
+
+macOSでは、Finder上のフォルダをターミナルへドラッグ＆ドロップすると、そのパスを入力することもできます。
 
 ---
 
-## 6. インストール
+## 4. Pythonが利用できるか確認する
 
-### 推奨：PyMeshLabを含む全部入り
+```bash
+python3 --version
+```
+
+例えば、
+
+```text
+Python 3.x.x
+```
+
+のように表示されればPython 3を利用できます。
+
+```text
+command not found: python3
+```
+
+などと表示される場合は、先にPython 3をインストールしてください。
+
+---
+
+## 5. 仮想環境を作成する（推奨）
+
+PotteryVolumeCalculatorフォルダ内で、
 
 ```bash
 python3 -m venv .venv
+```
+
+を実行します。
+
+続いて仮想環境を有効化します。
+
+### macOS / Linux
+
+```bash
 source .venv/bin/activate
+```
+
+成功すると、ターミナルの行頭に、
+
+```text
+(.venv)
+```
+
+のような表示が追加されます。
+
+### Windows PowerShell
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+仮想環境は一度作成すれば、毎回作り直す必要はありません。ただし、新しくターミナルを開いたときには再度`activate`してください。
+
+仮想環境を終了する場合：
+
+```bash
+deactivate
+```
+
+---
+
+## 6. 必要なPythonモジュールをインストールする
+
+PyMeshLabを含む環境：
+
+```bash
 python3 -m pip install -r requirements.txt
 ```
 
-`requirements.txt`では再現性のため、
-
-```text
-pymeshlab==2025.7.post1
-```
-
-に固定しています。
-
-### PyMeshLabなしで容量計算だけ行う
+PyMeshLabを使用せず、容量計算の基本機能だけを利用する場合：
 
 ```bash
 python3 -m pip install -r requirements-core.txt
 ```
 
-でも動作します。
-
-この場合も、
-
-- exact-coordinate weld
-- トポロジーQA
-- 破片境界保存
-- voxelization
-- spill判定
-- 容量計算
-
-は実行されます。
-
-### `No module named 'PIL'`
-
-インストール名は `PIL` ではなく、
-
-```bash
-python3 -m pip install Pillow
-```
-
-です。
+インストールは仮想環境ごとに通常1回だけ必要です。プログラムを実行するたびに再インストールする必要はありません。
 
 ---
 
-## 7. まず環境診断
-
-```bash
-python3 vessel_voxel_volume.py --diagnose-env
-```
-
-を実行してください。
-
-例：
-
-```text
-PotteryVolumeCalculator 1.2.0
-Python       : 3.13.x
-numpy        : ...
-trimesh      : ...
-pymeshlab    : ...
-
-PyMeshLab
-  import available : True
-  plugins loaded   : ...
-  get_topological_measures: True/False
-  meshing_remove_duplicate_vertices: True/False
-  meshing_remove_unreferenced_vertices: True/False
-```
-
-Falseがあっても通常実行は可能です。
-
----
-
-## 8. バージョン確認
+## 7. プログラムが起動するか確認する
 
 ```bash
 python3 vessel_voxel_volume.py --version
 ```
 
+次のように表示されれば起動できます。
+
 ```text
-vessel_voxel_volume.py 1.2.0
+vessel_voxel_volume.py 1.3.0
 ```
 
-を確認してください。
+環境の詳細を確認する場合：
+
+```bash
+python3 vessel_voxel_volume.py --diagnose-env
+```
 
 ---
 
-## 9. 基本実行
+## 8. 3Dモデルを準備する
 
-入力モデルがm単位、1 mm voxelなら：
+最初は、入力するPLYまたはOBJファイルを`vessel_voxel_volume.py`と同じフォルダへ置くと分かりやすくなります。
+
+例：
+
+```text
+PotteryVolumeCalculator/
+├── vessel_voxel_volume.py
+├── requirements.txt
+├── README.md
+└── 0015Jinmen_small.ply
+```
+
+モデルは**Z軸が上下方向**になるようにしてください。また、`--unit`にはモデル座標の実際の単位を指定してください。
+
+---
+
+## 9. 最初の計算を実行する
+
+モデル座標がm、pitchを1 mmとする場合：
+
+```bash
+python3 vessel_voxel_volume.py 0015Jinmen_small.ply \
+  --unit m \
+  --pitch 1.0
+```
+
+詳細検証モードなら：
+
+```bash
+python3 vessel_voxel_volume.py 0015Jinmen_small.ply \
+  --unit m \
+  --validate
+```
+
+### `\`は何か
+
+READMEのコマンド末尾にある`\`は、**コマンドが次の行へ続く**ことを示します。
+
+したがって、
+
+```bash
+python3 vessel_voxel_volume.py 0015Jinmen_small.ply \
+  --unit m \
+  --pitch 1.0
+```
+
+は、1行で、
 
 ```bash
 python3 vessel_voxel_volume.py 0015Jinmen_small.ply --unit m --pitch 1.0
 ```
 
-`--pitch`は入力モデルの単位にかかわらず**常にmm**です。
+と入力しても同じです。
 
 ---
 
-## 10. 出力単位
+## 10. 入力ファイルが別のフォルダにある場合
 
-内部計算はmmに統一します。
+ファイルのフルパスまたは相対パスを指定できます。
 
-入力がmなら、
+例：
 
-- processed PLY：m
-- QC用PLY：m
-- seed / spill height：m
-- 主容量：m³
-- 参考容量：L / mL
+```bash
+python3 vessel_voxel_volume.py ~/Documents/Pottery/0015Jinmen_small.ply \
+  --unit m \
+  --pitch 1.0
+```
 
-です。
+ファイル名やフォルダ名に空白がある場合は、パスを引用符で囲みます。
 
-入力がmmなら主容量はmm³、cmならcm³です。
+```bash
+python3 vessel_voxel_volume.py "/Users/username/Documents/Pottery Data/sample 01.ply" \
+  --unit m \
+  --pitch 1.0
+```
+
+macOSでは、FinderからPLYファイルをターミナルへドラッグ＆ドロップしてパスを入力する方法も便利です。
 
 ---
 
-## 11. 出力フォルダ
+## 11. 計算結果はどこに保存されるか
+
+`--output-dir`を指定しない場合、入力モデルと同じ場所に、
+
+```text
+<入力ファイル名>_PotteryVolume_v1/
+```
+
+というフォルダを作成します。
 
 例えば、
 
@@ -287,7 +341,423 @@ python3 vessel_voxel_volume.py 0015Jinmen_small.ply --unit m --pitch 1.0
 
 ```text
 0015Jinmen_small_PotteryVolume_v1/
+```
+
+です。
+
+同じ入力ファイル・同じpitchで再実行すると同じ出力フォルダを再利用し、同名の結果ファイルは更新されます。異なる実行結果を保存して比較したい場合は、別の`--output-dir`を指定してください。
+
+例：
+
+```bash
+python3 vessel_voxel_volume.py 0015Jinmen_small.ply \
+  --unit m \
+  --pitch 1.0 \
+  --output-dir test_run_01
+```
+
+---
+
+
+| 用途 | モード | 実行方法 |
+|---|---|---|
+| 詳細な精度・収束検証 | multi-pitch validation | `--validate` |
+| 大量資料を一定条件で処理 | single-pitch | `--pitch 1.0` など |
+
+---
+
+# 1. 想定するユースケース
+
+## A. 詳細な検証を行いたい
+
+1資料について、
+
+```text
+2.0 mm
+1.0 mm
+0.5 mm
+```
+
+の3解像度を一括実行します。
+
+```bash
+python3 vessel_voxel_volume.py pottery.ply \
+  --unit m \
+  --validate
+```
+
+各pitchは**独立した全工程**として実行します。
+
+```text
+exact-coordinate weld / QA
+↓
+Trimesh QA
+↓
+surface voxelization
+↓
+cavity seed validation
+↓
+spill-level
+↓
+volume
+```
+
+をpitchごとに再実行するため、詳細検証時には各解像度の結果が独立して再現可能です。
+
+処理時間は単一pitchより長くなります。特に0.5 mmはメモリ使用量と計算時間が大きくなります。
+
+---
+
+## B. 大量の資料を処理したい
+
+pitchを1つ指定して実行します。
+
+```bash
+python3 vessel_voxel_volume.py pottery.ply \
+  --unit m \
+  --pitch 1.0
+```
+
+例えば高速性を優先する場合：
+
+```bash
+--pitch 2.0
+```
+
+精度を優先する場合：
+
+```bash
+--pitch 0.5
+```
+
+とできます。
+
+`--pitch`を省略し、`--validate`も指定しなかった場合は、
+
+```text
+pitch = 1.0 mm
+```
+
+で実行します。
+
+このsingle-pitchモードを、次段階で予定している**フォルダ内PLY一括処理**の基本処理として使用します。
+
+---
+
+# 2. `--pitch`と`--validate`は同時に指定できない
+
+次のような指定はエラーになります。
+
+```bash
+python3 vessel_voxel_volume.py pottery.ply \
+  --pitch 1.0 \
+  --validate
+```
+
+どちらか一方を選択してください。
+
+---
+
+# 3. 容量の定義
+
+容量は、
+
+> 土器を+Z方向に直立させた状態で、液体が最初に外部へ流出する直前まで保持できる最大内容量
+
+と定義します。
+
+水平capは使用しません。
+
+非水平口縁でも、
+
+```text
+safe level
+↓
+spill level
+```
+
+を3D flood fillで探索します。
+
+---
+
+# 4. 入力メッシュの姿勢
+
+**Z軸を上下方向**にしてください。
+
+```text
+        +Z
+         ↑
+       口縁
+      ______
+     /      \
+    |        |
+    |        |
+     \______/
+        底
+```
+
+容量計算では重力方向を-Zとみなし、液面をZ方向に上昇させます。
+
+姿勢が誤っていると、spill-levelがまったく異なる値になります。
+
+---
+
+# 5. 入力単位
+
+次を指定できます。
+
+```text
+mm
+cm
+m
+```
+
+例：
+
+```bash
+--unit m
+```
+
+単位は自動判定しません。
+
+### 内部処理
+
+内部ではmmへ統一します。
+
+例えばm入力：
+
+```text
+input  : m
+internal: mm
+```
+
+### 出力
+
+m入力なら、
+
+- processed mesh：m
+- QC PLY：m
+- safe/spill level：m
+- 主容量：m³
+- 併記：L / mL
+
+となります。
+
+---
+
+# 6. single-pitchモード
+
+## 1 mm
+
+```bash
+python3 vessel_voxel_volume.py pottery.ply \
+  --unit m \
+  --pitch 1.0
+```
+
+## 2 mm
+
+```bash
+python3 vessel_voxel_volume.py pottery.ply \
+  --unit m \
+  --pitch 2.0
+```
+
+## 0.5 mm
+
+```bash
+python3 vessel_voxel_volume.py pottery.ply \
+  --unit m \
+  --pitch 0.5
+```
+
+`--pitch`は入力モデルの単位に関係なく**常にmm**です。
+
+---
+
+# 7. multi-pitch validationモード
+
+```bash
+python3 vessel_voxel_volume.py pottery.ply \
+  --unit m \
+  --validate
+```
+
+自動的に、
+
+```text
+2.0 mm
+1.0 mm
+0.5 mm
+```
+
+の順に実行します。
+
+実行中は、
+
+```text
+### Validation run 1/3 — pitch 2 mm
+### Validation run 2/3 — pitch 1 mm
+### Validation run 3/3 — pitch 0.5 mm
+```
+
+と表示します。
+
+---
+
+# 8. validation結果のまとめ
+
+validationモードでは通常のpitch別結果に加えて、
+
+```text
+validation_summary.json
+validation_summary.csv
+```
+
+を出力フォルダ直下に作成します。
+
+例えば、
+
+```text
+pottery_PotteryVolume_v1/
+├── validation_summary.json
+├── validation_summary.csv
+├── pitch_2mm/
+├── pitch_1mm/
+└── pitch_0p5mm/
+```
+
+となります。
+
+---
+
+# 9. validation_summary.csv
+
+主な項目：
+
+```text
+status
+pitch_mm
+safe_level_mm
+spill_level_mm
+spill_fraction_of_mesh_height
+volume_l
+volume_ml
+delta_from_coarser_l
+delta_from_coarser_pct_of_current
+total_time_s
+result_json
+error
+```
+
+例：
+
+```text
+pitch    volume
+2.0 mm   5.802720 L
+1.0 mm   5.917481 L
+0.5 mm   5.947995 L
+```
+
+のような収束状況を1ファイルで比較できます。
+
+---
+
+# 10. validation_summary.jsonの収束診断
+
+3条件すべてが成功すると、次の診断値も保存します。
+
+## finest vs next coarser
+
+0.5 mmと1.0 mmの差です。
+
+```text
+finest_vs_next_coarser_difference_l
+finest_vs_next_coarser_difference_percent_of_finest
+```
+
+実用上、最も分かりやすい収束指標です。
+
+## spill upper-level range
+
+```text
+spill_upper_range_mm
+```
+
+2 / 1 / 0.5 mm間でspill levelがどの程度変化したかを示します。
+
+## volume monotonicity
+
+```text
+volume_monotonic_with_refinement
+```
+
+pitchを細かくしたとき、容量値が一方向に収束しているかを示します。
+
+---
+
+# 11. 経験的収束次数と外挿値
+
+2 / 1 / 0.5 mmがすべて成功し、容量変化が同じ方向の場合には、
+
+```text
+empirical_order_q
+richardson_extrapolated_volume_l
+```
+
+も計算します。
+
+モデル：
+
+```text
+V(p) = V∞ + a p^q
+```
+
+を仮定した**診断値**です。
+
+重要：
+
+> `richardson_extrapolated_volume_l`は測定された容量値ではありません。
+
+研究成果の主値としては、原則として実際に計算した0.5 mm等の値を使用し、外挿値は収束診断の補助情報として扱ってください。
+
+---
+
+# 12. validation中に一部pitchが失敗した場合
+
+例えば2 mmは成功、1 mmは成功、0.5 mmがメモリ不足で失敗した場合でも、それまでの結果を失いません。
+
+プログラムは可能な限り残りのpitchも実行し、
+
+```text
+validation_summary.json
+validation_summary.csv
+```
+
+へ成功・失敗を記録します。
+
+ただし、1条件でも失敗した場合は最終的なコマンド終了コードをエラーとします。
+
+---
+
+# 13. 出力フォルダ
+
+入力：
+
+```text
+0015Jinmen_small.ply
+```
+
+なら、
+
+```text
+0015Jinmen_small_PotteryVolume_v1/
 ├── archaeological/
+│   ├── raw_boundary_vertices.ply
+│   ├── raw_boundaries_sampled.ply
+│   ├── raw_boundary_stats.json
+│   ├── raw_components.csv
+│   └── ...
 ├── processed/
 │   └── 0015Jinmen_small_exact_welded.ply
 ├── qa/
@@ -296,183 +766,514 @@ python3 vessel_voxel_volume.py 0015Jinmen_small.ply --unit m --pitch 1.0
 │   ├── exact_weld_report.json
 │   ├── pymeshlab_crosscheck.json
 │   └── preprocessing_summary.json
-└── pitch_1mm/
-    ├── result.json
-    ├── qa/
-    └── qc/
+├── pitch_2mm/
+├── pitch_1mm/
+└── pitch_0p5mm/
 ```
 
-となります。
-
-2 / 1 / 0.5 mmを実行すると、
+validationモードではさらに、
 
 ```text
-pitch_2mm/
-pitch_1mm/
-pitch_0p5mm/
+validation_summary.csv
+validation_summary.json
 ```
 
-へ分かれます。
+が加わります。
 
 ---
 
-## 12. Stage Aで確認する項目
+# 14. raw fragment boundaryの保存
 
-実行時に、
-
-```text
-boundary edges before
-boundary edges after
-components after
-2-manifold after
-closed 2-manifold
-non-2-manifold edges
-geometry preserved
-```
-
-を表示します。
-
-例えば、
+raw meshのboundary edgeは、容量計算とは別に、
 
 ```text
-boundary edges before: 17290
-boundary edges after : 0
+archaeological/
 ```
 
-なら、raw meshの境界の多くが、**同じ位置に重複した頂点によるトポロジー上のseam**だったことを示します。
+へ保存します。
 
-afterにも大量に残る場合は、実際の幾何学的隙間または開境界を検討します。
+これは復元土器から、
+
+- 実破片の位置
+- 破片サイズ
+- 接合関係
+
+などを再抽出する別用途に利用するためです。
+
+容量計算用コピーでは、
+
+- unreferenced vertex除去
+- 完全同一XYZ頂点だけをexact weld
+
+します。
+
+近い頂点を吸着する処理は行いません。
 
 ---
 
-## 13. PyMeshLab cross-check
+# 15. PyMeshLab
 
-```text
-=== Stage A2: PyMeshLab independent cross-check ===
-PyMeshLab version : ...
-plugins loaded    : ...
-cross-check status: ...
-used for calculation mesh: False
+PyMeshLabは独立cross-checkです。
+
+容量計算の必須依存ではありません。
+
+環境診断：
+
+```bash
+python3 vessel_voxel_volume.py --diagnose-env
 ```
 
-結果は、
+PyMeshLabを含む環境：
 
-```text
-qa/pymeshlab_crosscheck.json
+```bash
+python3 -m pip install -r requirements.txt
 ```
 
-に保存します。
+PyMeshLabなし：
 
-PyMeshLabのduplicate-removal filterが使える場合は、人工duplicate meshによるsynthetic smoke testも内部で実施します。
+```bash
+python3 -m pip install -r requirements-core.txt
+```
+
+でも容量計算できます。
 
 ---
 
-## 14. spillが低すぎる場合
-
-異常に低いspillを検出すると、
+# 16. PILエラー
 
 ```text
-surface_voxels.ply
-spill_slab_surface.ply
-spill_slab_free.ply
-spill_vs_raw_fragment_boundaries.ply
-spill_boundary_proximity.json
+No module named 'PIL'
 ```
 
-を出力します。
+の場合は、
 
-特に、
-
-```text
-fraction_within_one_pitch
+```bash
+python3 -m pip install Pillow
 ```
 
-は、spill経路がraw fragment boundary候補から1 voxel以内にある割合です。
-
-高い値は接合線由来の漏れを支持しますが、それだけで原因を断定するものではありません。
+です。
 
 ---
 
-## 15. voxelの詳細出力
+# 17. バージョン確認
 
-通常計算でもsurface voxel全体を確認したい場合：
+```bash
+python3 vessel_voxel_volume.py --version
+```
+
+```text
+vessel_voxel_volume.py 1.3.0
+```
+
+を確認してください。
+
+---
+
+# 18. QC
+
+各pitchフォルダ内：
+
+```text
+qc/
+├── fluid_surface.ply
+├── spill_level_region.ply
+├── seed_point.ply
+└── seed_candidates.ply
+```
+
+をCloudCompare等で元メッシュと重ねて確認します。
+
+主に、
+
+- fluid surfaceが器内に収まっている
+- spillが口縁付近にある
+- seedが内容空間にある
+
+ことを確認してください。
+
+---
+
+# 19. 推奨ワークフロー
+
+## 新しい資料・代表資料
+
+最初に、
 
 ```bash
 python3 vessel_voxel_volume.py pottery.ply \
   --unit m \
-  --pitch 1.0 \
-  --debug-voxels
+  --validate
 ```
 
----
+で2 / 1 / 0.5 mmの収束性を検証します。
 
-## 16. 複数解像度の比較
+ここで、
 
-研究用途では、
+- spill levelが安定
+- 1→0.5 mmの容量差が十分小さい
+- QC PLYが正常
 
-```bash
-python3 vessel_voxel_volume.py pottery.ply --unit m --pitch 2.0
-python3 vessel_voxel_volume.py pottery.ply --unit m --pitch 1.0
-python3 vessel_voxel_volume.py pottery.ply --unit m --pitch 0.5
-```
+であることを確認します。
 
-を推奨します。
+## 同種資料を大量処理
 
-surface voxelは厚さを持つため、容量は解像度依存です。
+検証結果から実用pitchを決めます。
 
----
-
-## 17. PyMeshLabを必須にする場合
+例えば1 mmで十分と判断したら、
 
 ```bash
 python3 vessel_voxel_volume.py pottery.ply \
   --unit m \
-  --pitch 1.0 \
-  --require-pymeshlab
+  --pitch 1.0
 ```
 
-この場合のみ、必要フィルタがロードされていない、またはPyMeshLab smoke testが失敗した場合にエラー終了します。
+を使用します。
 
-通常は指定しません。
+次段階では、このsingle-pitch処理を**指定フォルダ内のPLYへ順次適用するバッチ処理**へ拡張する予定です。
 
 ---
 
-## 18. 自己検証
+# 20. 計算量
 
-配布版について実施した検証は `SELF_TEST.md` に記録しています。
+voxel pitchを半分にすると、3次元gridのセル数は概ね8倍になります。
 
-少なくとも、
+したがって、
 
-- Python構文チェック
-- `--version`
+```text
+2 mm → 高速
+1 mm → 標準
+0.5 mm → 詳細検証
+```
+
+という使い分けを推奨します。
+
+---
+
+# 21. 自己検証
+
+配布前検証の詳細は、
+
+```text
+SELF_TEST.md
+```
+
+を参照してください。
+
+v1.3では、
+
+- 構文チェック
 - `--help`
 - `--diagnose-env`
-- PyMeshLabなしでの全工程
-- 全faceを分離した人工seamモデルのexact weld
-- mm入力とm入力の双方
-- m入力時のprocessed/QC PLY座標単位
-- `--require-pymeshlab`の意図的エラー
+- `--pitch`単一実行
+- `--validate` 2/1/0.5 mm完走
+- validation CSV/JSON生成
+- pitch間差分計算
+- 経験的収束診断
+- `--pitch`と`--validate`の同時指定拒否
+- m入力での単位保持
 
 を確認しています。
 
 ---
 
-## 19. 研究上の注意
+# 22. 初めてCLIを使う場合のFAQ
 
-容量値を研究成果として利用する前に、
+## Q1. `python`と`python3`はどちらを使いますか？
 
-1. 既知容量容器による精度検証
-2. 2 / 1 / 0.5 mmで収束確認
-3. raw / exact-weld後boundaryの比較
-4. spill位置のCloudCompare確認
-5. QA JSONの保存
+このREADMEでは、原則として、
 
-を推奨します。
+```bash
+python3
+```
 
-特に、
+を使用します。
 
-> 元メッシュのトポロジー  
-> exact weld後のトポロジー  
-> voxel障壁の連続性
+環境によって`python`がPython 3を指す場合もありますが、別バージョンを指す可能性があるため、READMEの例では`python3`に統一しています。
 
-は別々の問題として検証してください。
+---
+
+## Q2. 毎回`pip install`する必要がありますか？
+
+通常は必要ありません。
+
+仮想環境`.venv`を一度作成し、その中へrequirementsをインストールすれば、次回以降は、
+
+```bash
+cd <PotteryVolumeCalculatorのフォルダ>
+source .venv/bin/activate
+```
+
+としてからプログラムを実行します。
+
+---
+
+## Q3. `No module named ...`と表示されます
+
+まず仮想環境が有効か確認してください。
+
+ターミナルの行頭に、
+
+```text
+(.venv)
+```
+
+が表示されていなければ、
+
+```bash
+source .venv/bin/activate
+```
+
+を実行します。
+
+その後、
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+または、
+
+```bash
+python3 -m pip install -r requirements-core.txt
+```
+
+を実行してください。
+
+`No module named 'PIL'`の場合、パッケージ名は`PIL`ではなく`Pillow`です。
+
+---
+
+## Q4. `No such file or directory`と表示されます
+
+主に次を確認してください。
+
+1. `pwd`で現在のワーキングディレクトリを確認する
+2. `ls`で入力したファイル名が存在するか確認する
+3. ファイル名の大文字・小文字を確認する
+4. パスに空白がある場合は引用符で囲む
+
+例：
+
+```bash
+python3 vessel_voxel_volume.py "sample data.ply" --unit m --pitch 1.0
+```
+
+---
+
+## Q5. `can't open file 'vessel_voxel_volume.py'`と表示されます
+
+`vessel_voxel_volume.py`があるフォルダをワーキングディレクトリにしていない可能性があります。
+
+```bash
+pwd
+ls
+```
+
+で確認し、必要なら、
+
+```bash
+cd <PotteryVolumeCalculatorのフォルダ>
+```
+
+で移動してください。
+
+---
+
+## Q6. `.py`ファイルをダブルクリックしても動きません
+
+このプログラムはターミナルから、
+
+```bash
+python3 vessel_voxel_volume.py ...
+```
+
+として実行します。
+
+Finder上で`.py`ファイルをダブルクリックする必要はありません。
+
+---
+
+## Q7. `Permission denied`と表示されます
+
+このREADMEの方法では、
+
+```bash
+./vessel_voxel_volume.py
+```
+
+ではなく、
+
+```bash
+python3 vessel_voxel_volume.py
+```
+
+として実行してください。
+
+通常、`.py`ファイル自体へ実行権限を付ける必要はありません。
+
+---
+
+## Q8. PLYファイルはプログラムと同じフォルダに置く必要がありますか？
+
+必須ではありません。
+
+同じフォルダに置くと初心者には分かりやすいですが、別フォルダのファイルもパスを指定して処理できます。
+
+```bash
+python3 vessel_voxel_volume.py "/path/to/model.ply" --unit m --pitch 1.0
+```
+
+---
+
+## Q9. 計算中に止めたい場合はどうしますか？
+
+ターミナルで、
+
+```text
+Control + C
+```
+
+を押します。
+
+計算途中の出力ファイルが残る場合があります。中断後に同じ条件で再実行する場合は、出力内容を確認してください。
+
+---
+
+## Q10. 0.5 mmで非常に時間がかかります
+
+正常な場合があります。
+
+voxel pitchを半分にすると、3次元gridのセル数は概ね8倍になります。そのため、
+
+```text
+2 mm   → 比較的高速
+1 mm   → 標準
+0.5 mm → 詳細検証・高負荷
+```
+
+という使い分けを想定しています。
+
+大量資料を処理する場合は、代表資料を`--validate`で検証した上で、実用的な単一pitchを決めることを推奨します。
+
+---
+
+## Q11. `Killed`、メモリ不足、または極端に遅くなります
+
+voxel gridが大きすぎる可能性があります。
+
+まず、
+
+```text
+0.5 mm → 1.0 mm
+```
+
+または、
+
+```text
+1.0 mm → 2.0 mm
+```
+
+のようにpitchを大きくして確認してください。
+
+他のメモリを大量に使用するアプリケーションを終了することも有効です。
+
+---
+
+## Q12. `--unit`には何を指定しますか？
+
+PLY / OBJ内の**座標値が表している実際の長さ単位**を指定します。
+
+例えば座標値`0.25`が25 cmを意味するモデルなら、
+
+```bash
+--unit m
+```
+
+です。
+
+指定可能なのは、
+
+```text
+mm
+cm
+m
+```
+
+です。
+
+単位を誤ると容量も大きく誤るため、必ず確認してください。
+
+---
+
+## Q13. なぜZ軸を上下方向にする必要がありますか？
+
+このプログラムは、
+
+```text
++Z = 上
+-Z = 重力方向
+```
+
+として液面を上昇させ、spill levelを探索します。
+
+土器が横倒しになっていると、「容量」の意味が変わってしまいます。計算前に3Dソフトで姿勢を確認してください。
+
+---
+
+## Q14. 計算が成功したら、その容量値をそのまま採用してよいですか？
+
+研究用途では、計算完走だけでなくQCも確認してください。
+
+少なくとも、
+
+- `fluid_surface.ply`が器内に収まっている
+- spill levelが妥当な位置にある
+- seedが内容空間にある
+- 必要に応じて2 / 1 / 0.5 mmで収束性を確認する
+
+ことを推奨します。
+
+詳細検証には、
+
+```bash
+--validate
+```
+
+を使用してください。
+
+---
+
+## Q15. ターミナルを閉じた後、次回は何をすればよいですか？
+
+仮想環境をすでに作成済みなら、基本的には次の3段階です。
+
+```bash
+cd <PotteryVolumeCalculatorのフォルダ>
+source .venv/bin/activate
+python3 vessel_voxel_volume.py <model.ply> --unit m --pitch 1.0
+```
+
+requirementsの再インストールやvenvの再作成は通常不要です。
+
+---
+
+## Q16. コマンドを間違えたか分からなくなりました
+
+利用可能なオプションは、
+
+```bash
+python3 vessel_voxel_volume.py --help
+```
+
+で確認できます。
+
+環境を確認する場合は、
+
+```bash
+python3 vessel_voxel_volume.py --diagnose-env
+```
+
+を使用してください。
+
+エラーについて相談する場合は、**エラーメッセージだけでなく、その直前からのターミナル出力も含めて**保存すると原因を特定しやすくなります。
+
