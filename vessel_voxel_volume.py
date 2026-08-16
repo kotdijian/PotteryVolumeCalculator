@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PotteryVolumeCalculator
-Version 1.3.0
+Version 1.3.1
 
 OBJ / PLY の土器メッシュから、内面を明示的に抽出せず、
 「液体が最初に外へ溢れ出す直前までの最大内容量」を voxel 法で推定する。
@@ -17,8 +17,9 @@ v1 の主要方針
 6. spill直前までの空隙を最大保持液量として計算
 7. 出力PLYの座標単位は入力モデルと同じ単位へ戻す
 8. 出力ファイルは専用フォルダ内へ整理
-9. raw boundary edge を「破片境界候補」として別系統で保存
-10. duplicate removal 前後の boundary を比較し、spillとの近接も診断
+9. archaeological/raw_* は v1.3.1 では出力しない
+   （texture UV seam と考古学的接合境界を区別できないため一時停止）
+10. exact-coordinate weld 後の topology / boundary は QA 用に保存
 
 対象（v1）
 ----------
@@ -52,7 +53,7 @@ from contextlib import redirect_stdout
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 
 # ----------------------------------------------------------------------
@@ -969,24 +970,20 @@ def stage_a_preprocess(
     require_pymeshlab: bool = False,
 ):
     """
-    Reference preprocessing:
+    Reference preprocessing (v1.3.1 interim boundary-output policy):
       1. Trimesh file I/O, process=False
-      2. Preserve raw archaeological boundary derivatives
-      3. Deterministic raw topology QA
-      4. NumPy exact-coordinate weld + unreferenced removal
-      5. Deterministic post-weld topology QA
+      2. Deterministic loader-state topology QA
+      3. NumPy exact-coordinate weld + unreferenced removal
+      4. Deterministic post-weld topology QA
+      5. Export post-weld boundary/component products for QA only
       6. Optional PyMeshLab cross-check ONLY
+
+    IMPORTANT:
+    archaeological/raw_* products are intentionally disabled in v1.3.1.
+    The current PLY loader may re-index texture UV seams, so pre-weld
+    boundary edges cannot safely be interpreted as archaeological sherd joins.
     """
     vertices_before, faces_before = load_mesh_arrays_with_trimesh(input_path)
-
-    raw_boundary_stats, raw_boundary_samples = export_boundary_products(
-        vertices_before,
-        faces_before,
-        archaeological_dir,
-        unit,
-        prefix="raw",
-        sample_spacing_mm=boundary_sample_mm,
-    )
 
     topology_before = topology_summary_from_arrays(
         vertices_before, faces_before
@@ -1012,16 +1009,6 @@ def stage_a_preprocess(
         sample_spacing_mm=boundary_sample_mm,
     )
 
-    boundary_comparison = export_boundary_comparison(
-        archaeological_dir,
-        raw_boundary_stats,
-        cleaned_boundary_stats,
-        vertices_removed=(
-            cleanup["exact_duplicate_vertices_removed"]
-            + cleanup["unreferenced_vertices_removed"]
-        ),
-    )
-
     cleaned_path = processed_dir / f"{input_path.stem}_exact_welded.ply"
     trimesh.Trimesh(
         vertices=vertices_after,
@@ -1043,12 +1030,23 @@ def stage_a_preprocess(
 
     report = {
         "reference_engine": "NumPy + Trimesh",
+        "raw_archaeological_derivatives": {
+            "enabled": False,
+            "reason": (
+                "Disabled in v1.3.1 because texture-UV reindexing can create "
+                "pre-weld boundary seams that are not archaeological join boundaries."
+            ),
+        },
         "before": {
             "counts": {
                 "vertices": int(len(vertices_before)),
                 "faces": int(len(faces_before)),
             },
             "summary": topology_before,
+            "note": (
+                "Pre-weld topology is retained as a loader-state diagnostic only; "
+                "it is not exported as archaeological/raw_* data."
+            ),
         },
         "after": {
             "counts": {
@@ -1067,17 +1065,13 @@ def stage_a_preprocess(
         "input_reader": "trimesh",
         "processed_mesh_writer": "trimesh",
         "pymeshlab_crosscheck": pml_report,
-        "raw_boundary": raw_boundary_stats,
         "after_exact_weld_boundary": cleaned_boundary_stats,
-        "boundary_comparison": boundary_comparison,
     }
     write_json(qa_dir / "preprocessing_summary.json", report)
 
     archaeological = {
-        "raw_boundary_stats": raw_boundary_stats,
+        "raw_derivatives_enabled": False,
         "cleaned_boundary_stats": cleaned_boundary_stats,
-        "boundary_comparison": boundary_comparison,
-        "raw_boundary_samples_native": raw_boundary_samples,
         "cleaned_boundary_samples_native": cleaned_boundary_samples,
     }
 
@@ -1820,19 +1814,12 @@ def estimate_volume(
     print(f"plugins loaded    : {pml_env.get('plugins_loaded')}")
     print(f"cross-check status: {pml_cross.get('status')}")
     print("used for calculation mesh: False")
+    print("archaeological/raw_*  : disabled (v1.3.1 interim policy)")
     print(
-        f"raw boundary edges    : "
-        f"{archaeological['raw_boundary_stats']['boundary_edges']:,}"
-    )
-    print(
-        f"after duplicate edges : "
+        f"after exact-weld boundary edges: "
         f"{archaeological['cleaned_boundary_stats']['boundary_edges']:,}"
     )
-    print(
-        f"raw components        : "
-        f"{archaeological['raw_boundary_stats']['component_count']:,}"
-    )
-    print(f"archaeological output : {layout['archaeological']}")
+    print(f"archaeological QA output: {layout['archaeological']}")
 
     # ---- Internal Trimesh in mm ----
     vertices_mm = vertices_native * scale_to_mm
@@ -2031,9 +2018,8 @@ def estimate_volume(
             "output_directory": str(layout["base"]),
             "preprocessing_qa": pml_report,
             "archaeological_boundary_derivatives": {
-                "raw": archaeological["raw_boundary_stats"],
+                "raw_enabled": False,
                 "after_exact_weld": archaeological["cleaned_boundary_stats"],
-                "comparison": archaeological["boundary_comparison"],
             },
             "trimesh_qa": tm_report,
             "voxel_qa": voxel_qa,
@@ -2154,33 +2140,10 @@ def estimate_volume(
         print(f"spill slab wall: {slab_surface_path}")
         print(f"spill slab free: {slab_free_path}")
 
-        # Quantify and visualize relation between spill path and raw fragment boundaries.
-        slab_free_indices = np.argwhere(slab_free)
-        spill_free_native = (
-            padded_indices_to_points_mm(vox, slab_free_indices, pad) / scale_to_mm
-            if len(slab_free_indices) else np.empty((0, 3), dtype=np.float64)
-        )
-        raw_boundary_samples = archaeological["raw_boundary_samples_native"]
-        proximity = boundary_spill_proximity(
-            raw_boundary_samples, spill_free_native, unit, pitch
-        )
-        proximity_path = layout["run_qa"] / "spill_boundary_proximity.json"
-        write_json(proximity_path, proximity)
-        qc_files["spill_boundary_proximity_json"] = str(proximity_path)
-
-        overlap_path = layout["qc"] / "spill_vs_raw_fragment_boundaries.ply"
-        overlap_count = export_colored_overlap(
-            raw_boundary_samples, spill_free_native, overlap_path
-        )
-        if overlap_count:
-            qc_files["spill_vs_raw_fragment_boundaries_ply"] = str(overlap_path)
-            print(f"spill vs seams : {overlap_path} ({overlap_count:,} points)")
-        if proximity.get("available"):
-            print(
-                "spill near raw boundary: "
-                f"<=0.5 pitch {proximity['fraction_within_half_pitch']:.3f}, "
-                f"<=1 pitch {proximity['fraction_within_one_pitch']:.3f}"
-            )
+        # v1.3.1: raw-boundary proximity/overlap outputs are disabled.
+        # Pre-weld texture UV seams cannot yet be separated reliably from
+        # archaeological join boundaries.
+        voxel_qa["raw_boundary_spill_comparison_enabled"] = False
 
     voxel_qa.update({
         "safe_level_z_mm": safe_z_mm,
@@ -2217,9 +2180,8 @@ def estimate_volume(
         "mesh_extents_native_unit": unit,
         "preprocessing_qa": pml_report,
         "archaeological_boundary_derivatives": {
-            "raw": archaeological["raw_boundary_stats"],
+            "raw_enabled": False,
             "after_exact_weld": archaeological["cleaned_boundary_stats"],
-            "comparison": archaeological["boundary_comparison"],
         },
         "trimesh_qa": tm_report,
         "voxel_qa": voxel_qa,
@@ -2721,8 +2683,8 @@ def main():
         type=float,
         default=0.5,
         help=(
-            "raw/cleaned boundaryを線として保存する際のサンプリング間隔 [mm]。"
-            "既定値 0.5。容量計算には影響しない"
+            "after-exact-weld boundaryをQA用に線として保存する際のサンプリング間隔 [mm]。"
+            "v1.3.1ではarchaeological/raw_*は出力しない。容量計算には影響しない"
         ),
     )
     parser.add_argument(

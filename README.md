@@ -1,8 +1,10 @@
-# PotteryVolumeCalculator v1.3.0
+# PotteryVolumeCalculator v1.3.1
 
 PLY / OBJ形式の土器3Dメッシュから、**液体が最初に外へ溢れ出す直前までの最大内容量**をvoxel法で推定する実験用ツールです。
 
 v1.3では、用途に応じて次の2モードを並列実装しました。
+
+> **v1.3.1の変更点**：テクスチャUV seamを考古学的な接合境界と誤認する可能性が確認されたため、`archaeological/raw_*`の出力と、raw boundaryを用いたspill近接診断を一時的に停止しました。容量計算アルゴリズム自体はv1.3.0から変更していません。接合境界抽出は別アルゴリズムとして再設計します。
 
 ## このプログラムに適した3Dモデル
 
@@ -36,7 +38,6 @@ PotteryVolumeCalculatorは、土器3Dモデルの形状から、**液体を保�
 - **人面墨書土器（奈良時代）**
 - 静岡県磐田市御殿・二之宮遺跡出土
 - 磐田市埋蔵文化財センター所蔵
-- レガシズ3D掲載名：**人面墨書土器2**
 - レガシズ3Dよりダウンロード  
   https://lega-shizu.com/legashizu3d/archives/data/117
 - レガシズ3D上のモデル識別情報：LS0015
@@ -246,7 +247,7 @@ python3 vessel_voxel_volume.py --version
 次のように表示されれば起動できます。
 
 ```text
-vessel_voxel_volume.py 1.3.0
+vessel_voxel_volume.py 1.3.1
 ```
 
 環境の詳細を確認する場合：
@@ -895,11 +896,10 @@ validation_summary.csv
 ```text
 0015Jinmen_small_PotteryVolume_v1/
 ├── archaeological/
-│   ├── raw_boundary_vertices.ply
-│   ├── raw_boundaries_sampled.ply
-│   ├── raw_boundary_stats.json
-│   ├── raw_components.csv
-│   └── ...
+│   ├── after_exact_weld_boundary_stats.json
+│   ├── after_exact_weld_components.csv
+│   ├── after_exact_weld_components.json
+│   └── after_exact_weld_components_colored.ply
 ├── processed/
 │   └── 0015Jinmen_small_exact_welded.ply
 ├── qa/
@@ -924,36 +924,33 @@ validation_summary.json
 
 ---
 
-# 14. raw fragment boundaryの保存
+# 14. 接合境界関連データの暫定的な扱い
 
+### `archaeological/raw_*`はv1.3.1では出力しません
 
-> **テクスチャ付きPLYに関する注意**  
-> PLYがfaceごとのUV座標を持つ場合、Trimeshの既定読込ではUVの違いに応じて同一位置の頂点が再分割されることがあります。この場合、`raw_boundary_*`には元PLYの幾何学的境界ではなく、テクスチャUV seam由来の境界が含まれる可能性があります。したがって、現行v1.3.0の`archaeological/raw_*`を実破片の接合線と直接同定してはいけません。容量計算用メッシュではexact-coordinate weldにより同一位置頂点を統合しますが、考古学的な破片境界抽出については今後、元PLYのface index topologyを保持した読込方式へ改修する予定です。
+検証の結果、faceごとのUV座標を持つPLYでは、Trimeshの既定読込により同一位置のvertexがUV seamに沿って再分割される場合があることが確認されました。そのため、pre-weld状態で検出されるboundary edgeをそのまま実際の土器破片の接合境界とみなすことはできません。
 
-raw meshのboundary edgeは、容量計算とは別に、
+この誤認を避けるため、v1.3.1では以下を一時停止しています。
+
+- `archaeological/raw_boundary_*`
+- `archaeological/raw_components.*`
+- `boundary_before_after_comparison.json`
+- `spill_vs_raw_fragment_boundaries.ply`
+- `spill_boundary_proximity.json`
+
+これらは**容量計算には使用しません**。したがって、停止によって最大保持容量の計算方法は変わりません。
+
+`archaeological/`には当面、exact-coordinate weld後のQA用データだけを保存します。
 
 ```text
 archaeological/
+├── after_exact_weld_boundary_stats.json
+├── after_exact_weld_components.csv
+├── after_exact_weld_components.json
+└── after_exact_weld_components_colored.ply
 ```
 
-へ保存します。
-
-これは復元土器から、
-
-- 実破片の位置
-- 破片サイズ
-- 接合関係
-
-などを再抽出する別用途に利用するためです。
-
-容量計算用コピーでは、
-
-- unreferenced vertex除去
-- 完全同一XYZ頂点だけをexact weld
-
-します。
-
-近い頂点を吸着する処理は行いません。
+これらも現段階では**実破片の境界・破片そのものを自動同定した結果ではありません**。接合境界の抽出は、元PLY topology、face-corner UV、形状の曲率・dihedral angle、表面色などを別々の特徴量として扱う方法を検討します。
 
 ---
 
@@ -1008,7 +1005,7 @@ python3 vessel_voxel_volume.py --version
 ```
 
 ```text
-vessel_voxel_volume.py 1.3.0
+vessel_voxel_volume.py 1.3.1
 ```
 
 を確認してください。
@@ -1105,7 +1102,7 @@ SELF_TEST.md
 
 を参照してください。
 
-v1.3では、
+v1.3.1では、
 
 - 構文チェック
 - `--help`
@@ -1117,6 +1114,7 @@ v1.3では、
 - 経験的収束診断
 - `--pitch`と`--validate`の同時指定拒否
 - m入力での単位保持
+- `archaeological/raw_*`が生成されないこと
 
 を確認しています。
 
