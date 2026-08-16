@@ -29,6 +29,24 @@ PotteryVolumeCalculatorは、土器3Dモデルの形状から、**液体を保�
 ---
 
 
+## 検証用サンプルデータの出典
+
+本READMEおよび開発・検証レポートで使用している`0015Jinmen_small.ply`のサンプルデータは、以下の文化財3Dデータを出典とします。
+
+- **人面墨書土器（奈良時代）**
+- 静岡県磐田市御殿・二之宮遺跡出土
+- 磐田市埋蔵文化財センター所蔵
+- レガシズ3D掲載名：**人面墨書土器2**
+- レガシズ3Dよりダウンロード  
+  https://lega-shizu.com/legashizu3d/archives/data/117
+- レガシズ3D上のモデル識別情報：LS0015
+
+本プログラムの検証結果は、このサンプルモデルを**Z軸が上下方向**になるように配置した状態で算出しています。
+
+---
+
+
+
 # 初めてPython・CLIを使う方へ
 
 このプログラムは、**ターミナル（Terminal）からコマンドを入力して実行するCLI（Command Line Interface）プログラム**です。専用のGUIアプリを開くのではなく、Pythonに「どのファイルを、どの設定で処理するか」を文字で指定します。
@@ -345,7 +363,16 @@ macOSでは、FinderからPLYファイルをターミナルへドラッグ＆ド
 
 です。
 
-同じ入力ファイル・同じpitchで再実行すると同じ出力フォルダを再利用し、同名の結果ファイルは更新されます。異なる実行結果を保存して比較したい場合は、別の`--output-dir`を指定してください。
+同じ入力ファイル・同じpitchで再実行すると同じ出力フォルダを再利用し、同名の結果ファイルは更新されます。
+
+
+### 監査・正式検証では新しい出力フォルダを使用する
+
+同じ出力フォルダへ複数回実行すると、現在の実行では生成されなかった過去の`error.json`やdebug用PLYが残る場合があります。`result.json`と`validation_summary.json`は更新されますが、**古い診断ファイルが自動削除されるわけではありません**。
+
+研究用の正式な検証では、既存出力フォルダを退避または削除するか、実行ごとに新しい`--output-dir`を指定してください。
+
+異なる実行結果を保存して比較したい場合は、別の`--output-dir`を指定してください。
 
 例：
 
@@ -358,6 +385,121 @@ python3 vessel_voxel_volume.py 0015Jinmen_small.ply \
 
 ---
 
+
+
+## WindowsでのPython・CLI利用
+
+README中のmacOS / Linuxの例では`python3`を使用していますが、Windowsでは環境によって`python3`コマンドが存在しないことがあります。Windowsでは、Python Launcherが利用できる場合は`py -3`、仮想環境を有効化した後は`python`を使用する方法が分かりやすいです。
+
+### 1. PowerShellまたはWindows Terminalを開く
+
+Windows 11では、スタートメニューから**Windows Terminal**または**PowerShell**を起動できます。
+
+### 2. Pythonを確認する
+
+```powershell
+py -3 --version
+```
+
+または、
+
+```powershell
+python --version
+```
+
+でPython 3が表示されることを確認します。
+
+### 3. PotteryVolumeCalculatorフォルダへ移動する
+
+例：
+
+```powershell
+cd "$HOME\Downloads\PotteryVolumeCalculator"
+```
+
+現在の場所は、
+
+```powershell
+Get-Location
+```
+
+ファイル一覧は、
+
+```powershell
+Get-ChildItem
+```
+
+で確認できます。
+
+### 4. 仮想環境を作成する
+
+```powershell
+py -3 -m venv .venv
+```
+
+### 5. 仮想環境を有効化する
+
+PowerShell：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+PowerShellの実行ポリシーによりactivation scriptを実行できない場合は、Windowsのセキュリティ設定を恒久的に変更する前に、**コマンドプロンプト（cmd.exe）を使う方法**を推奨します。
+
+コマンドプロンプトでは：
+
+```bat
+.venv\Scripts\activate.bat
+```
+
+仮想環境が有効になると、通常は行頭に、
+
+```text
+(.venv)
+```
+
+と表示されます。
+
+### 6. 必要なモジュールをインストールする
+
+仮想環境を有効化した状態で：
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+PyMeshLabなしの基本環境なら：
+
+```powershell
+python -m pip install -r requirements-core.txt
+```
+
+### 7. バージョン確認
+
+```powershell
+python vessel_voxel_volume.py --version
+```
+
+### 8. single-pitch modeを実行する
+
+```powershell
+python vessel_voxel_volume.py 0015Jinmen_small.ply --unit m --pitch 1.0
+```
+
+### 9. validation modeを実行する
+
+```powershell
+python vessel_voxel_volume.py 0015Jinmen_small.ply --unit m --validate
+```
+
+Windowsでも、ファイル名やフォルダ名に空白がある場合はパスを引用符で囲んでください。
+
+```powershell
+python vessel_voxel_volume.py "C:\Users\username\Documents\Pottery Data\sample 01.ply" --unit m --pitch 1.0
+```
+
+---
 
 | 用途 | モード | 実行方法 |
 |---|---|---|
@@ -783,6 +925,10 @@ validation_summary.json
 ---
 
 # 14. raw fragment boundaryの保存
+
+
+> **テクスチャ付きPLYに関する注意**  
+> PLYがfaceごとのUV座標を持つ場合、Trimeshの既定読込ではUVの違いに応じて同一位置の頂点が再分割されることがあります。この場合、`raw_boundary_*`には元PLYの幾何学的境界ではなく、テクスチャUV seam由来の境界が含まれる可能性があります。したがって、現行v1.3.0の`archaeological/raw_*`を実破片の接合線と直接同定してはいけません。容量計算用メッシュではexact-coordinate weldにより同一位置頂点を統合しますが、考古学的な破片境界抽出については今後、元PLYのface index topologyを保持した読込方式へ改修する予定です。
 
 raw meshのboundary edgeは、容量計算とは別に、
 
