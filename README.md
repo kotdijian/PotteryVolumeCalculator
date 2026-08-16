@@ -1,11 +1,11 @@
-# PotteryVolumeCalculator v1.1.0
+# PotteryVolumeCalculator v1.1.1
 
 OBJ / PLY 形式の土器3Dメッシュから、**液体が最初に外へ溢れ出す直前までの最大内容量**をボクセル法で推定する実験用ツールです。
 
 Pythonを初めて使う文系・考古学系研究者でも試せるように、インストールから結果の確認まで順番に説明します。
 
 
-## v1.1.0の変更点
+## v1.1.1の変更点
 
 v1.1では、Trimeshがraw meshで検出するboundary edgeを、容量計算上の単なる「エラー候補」として捨てず、**復元土器の破片接合線・破片位置を再抽出するための考古学的派生データ**として別系統で保存します。
 
@@ -38,6 +38,42 @@ v1.1では、Trimeshがraw meshで検出するboundary edgeを、容量計算上
 ### PyMeshLabのファイルI/Oについて
 
 PyMeshLabにはPLY/OBJを直接読み込ませません。ファイルI/OはTrimesh、QAとduplicate vertex除去はPyMeshLabが担当します。これにより一部環境の`Unknown format for load: ply`を回避します。
+
+---
+
+## v1.1.1: PyMeshLab filter API互換修正
+
+PyMeshLabのバージョンによっては、次のエラーが出る場合があります。
+
+```text
+'pymeshlab.pmeshlab.MeshSet' object has no attribute 'get_topological_measures'
+```
+
+`get_topological_measures`自体はMeshLabの正式なトポロジー計測フィルタですが、
+PyMeshLabのリリースによって呼び出し方が異なることがあります。
+
+v1.1.1では、
+
+```python
+ms.get_topological_measures()
+```
+
+のような直接メソッドが存在すればそれを使用し、存在しなければ、
+
+```python
+ms.apply_filter("get_topological_measures")
+```
+
+へ自動的に切り替えます。
+
+同じ互換処理を、
+
+- `meshing_remove_duplicate_vertices`
+- `meshing_remove_unreferenced_vertices`
+
+にも適用しています。
+
+この変更はトポロジーQAの内容、破片境界抽出、voxel spill計算のアルゴリズム自体は変更しません。
 
 ---
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PotteryVolumeCalculator
-Version 1.1.0
+Version 1.1.1
 
 OBJ / PLY の土器メッシュから、内面を明示的に抽出せず、
 「液体が最初に外へ溢れ出す直前までの最大内容量」を voxel 法で推定する。
@@ -48,7 +48,7 @@ import sys
 import time
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 
 # ----------------------------------------------------------------------
@@ -467,6 +467,41 @@ def boundary_spill_proximity(boundary_points_native, spill_points_native, unit, 
 # Stage A: PyMeshLab QA and conservative preprocessing
 # ----------------------------------------------------------------------
 
+def pml_filter(ms, filter_name: str, **kwargs):
+    """
+    PyMeshLab filter compatibility wrapper.
+
+    PyMeshLab releases differ in how MeshLab filters are exposed:
+    - newer releases may expose generated methods such as
+      ms.get_topological_measures()
+    - other releases expose the same filter through
+      ms.apply_filter("get_topological_measures")
+
+    The generic apply_filter route is used as a fallback.
+    """
+    direct = getattr(ms, filter_name, None)
+    if callable(direct):
+        return direct(**kwargs)
+
+    apply_filter = getattr(ms, "apply_filter", None)
+    if callable(apply_filter):
+        return apply_filter(filter_name, **kwargs)
+
+    raise RuntimeError(
+        "PyMeshLab filter APIを利用できません。\n"
+        f"filter: {filter_name}\n"
+        "MeshSetに直接filter methodもapply_filter()もありません。"
+    )
+
+
+def pml_filter_api_mode(ms, filter_name: str) -> str:
+    if callable(getattr(ms, filter_name, None)):
+        return "direct method"
+    if callable(getattr(ms, "apply_filter", None)):
+        return "apply_filter"
+    return "unavailable"
+
+
 def topology_summary(measures: dict) -> dict:
     """
     get_topological_measures() の主要項目を抽出。
@@ -573,36 +608,51 @@ def pymeshlab_preprocess(
     ms = pymeshlab.MeshSet()
     ms.add_mesh(pm_mesh, input_path.stem)
 
+    pml_api = {
+        "get_topological_measures": pml_filter_api_mode(
+            ms, "get_topological_measures"
+        ),
+        "meshing_remove_duplicate_vertices": pml_filter_api_mode(
+            ms, "meshing_remove_duplicate_vertices"
+        ),
+        "meshing_remove_unreferenced_vertices": pml_filter_api_mode(
+            ms, "meshing_remove_unreferenced_vertices"
+        ),
+    }
+
     mesh_before = ms.current_mesh()
     before_counts = {
         "vertices": int(mesh_before.vertex_number()),
         "faces": int(mesh_before.face_number()),
     }
 
-    topo_before_raw = ms.get_topological_measures()
+    topo_before_raw = pml_filter(ms, "get_topological_measures")
     topo_before = {
         "counts": before_counts,
         "summary": topology_summary(topo_before_raw),
         "raw": jsonable(topo_before_raw),
         "file_io": "Trimesh -> NumPy arrays -> PyMeshLab Mesh",
+        "filter_api": pml_api,
     }
     write_json(qa_dir / "pymeshlab_before.json", topo_before)
 
     # Conservative preprocessing only.
-    ms.meshing_remove_duplicate_vertices()
-    ms.meshing_remove_unreferenced_vertices()
+    pml_filter(ms, "meshing_remove_duplicate_vertices")
+    pml_filter(ms, "meshing_remove_unreferenced_vertices")
 
     mesh_after = ms.current_mesh()
 
-    # Matrix extraction requires compact mesh.
-    mesh_after.compact()
+    # Matrix extraction prefers a compact mesh when supported.
+    compact_method = getattr(mesh_after, "compact", None)
+    if callable(compact_method):
+        compact_method()
 
     after_counts = {
         "vertices": int(mesh_after.vertex_number()),
         "faces": int(mesh_after.face_number()),
     }
 
-    topo_after_raw = ms.get_topological_measures()
+    topo_after_raw = pml_filter(ms, "get_topological_measures")
     topo_after = {
         "counts": after_counts,
         "summary": topology_summary(topo_after_raw),
@@ -659,6 +709,7 @@ def pymeshlab_preprocess(
         "qa_engine": "pymeshlab",
         "processed_mesh_writer": "trimesh",
         "pymeshlab_file_io_used": False,
+        "pymeshlab_filter_api": pml_api,
         "raw_boundary": raw_boundary_stats,
         "after_duplicate_removal_boundary": cleaned_boundary_stats,
         "boundary_comparison": boundary_comparison,
@@ -1067,6 +1118,7 @@ def estimate_volume(
     print("\n=== Stage A: PyMeshLab QA / preprocessing ===")
     print("file I/O   : Trimesh")
     print("QA engine  : PyMeshLab (NumPy array import)")
+    print("filter API : auto (direct method / apply_filter compatibility)")
     tp = time.perf_counter()
     vertices_native, faces, pml_report, archaeological = pymeshlab_preprocess(
         input_path,
