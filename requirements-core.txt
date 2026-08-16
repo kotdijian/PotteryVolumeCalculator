@@ -2,4 +2,3 @@ numpy>=1.26
 scipy>=1.11
 trimesh>=4.0,<6
 Pillow>=10
-pymeshlab==2025.7.post1

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PotteryVolumeCalculator
-Version 1.1.1
+Version 1.2.0
 
 OBJ / PLY の土器メッシュから、内面を明示的に抽出せず、
 「液体が最初に外へ溢れ出す直前までの最大内容量」を voxel 法で推定する。
@@ -42,13 +42,17 @@ from __future__ import annotations
 import argparse
 import colorsys
 import csv
+import io
 import json
 import math
+import platform
 import sys
 import time
+from contextlib import redirect_stdout
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 
 # ----------------------------------------------------------------------
@@ -72,7 +76,9 @@ def dependency_error(exc: ModuleNotFoundError) -> None:
         "仮想環境 (.venv) を有効にした状態で次を実行してください。\n"
         "  python3 -m pip install -r requirements.txt\n\n"
         "requirements.txt を使わない場合:\n"
-        "  python3 -m pip install numpy scipy trimesh Pillow pymeshlab\n",
+        "  python3 -m pip install numpy scipy trimesh Pillow\n"
+        "PyMeshLab cross-checkも使う場合:\n"
+        "  python3 -m pip install pymeshlab\n",
         file=sys.stderr,
     )
     raise SystemExit(2)
@@ -81,12 +87,20 @@ def dependency_error(exc: ModuleNotFoundError) -> None:
 try:
     import numpy as np
     import trimesh
-    import pymeshlab
     import PIL  # noqa: F401  # trimesh の soft dependency 対策
     from scipy import ndimage
     from scipy.spatial import cKDTree
 except ModuleNotFoundError as exc:
     dependency_error(exc)
+
+# PyMeshLab is an optional cross-check layer in v1.2.
+# Core preprocessing and volume calculation do not depend on its plugins.
+try:
+    import pymeshlab
+    PYMESHLAB_IMPORT_ERROR = None
+except Exception as exc:  # plugin/dynamic-library import failures are also non-fatal
+    pymeshlab = None
+    PYMESHLAB_IMPORT_ERROR = repr(exc)
 
 
 # ----------------------------------------------------------------------
@@ -407,9 +421,9 @@ def export_boundary_comparison(archaeological_dir, raw_stats, cleaned_stats,
         ),
         "raw_connected_components": raw_stats.get("component_count"),
         "after_duplicate_removal_connected_components": cleaned_stats.get("component_count"),
-        "vertices_removed_by_pymeshlab": int(vertices_removed),
+        "vertices_removed_by_exact_weld": int(vertices_removed),
         "interpretation": (
-            "Large reduction after duplicate removal suggests topological seams at "
+            "Large reduction after exact-coordinate weld suggests topological seams at "
             "coincident geometry. Remaining boundaries may represent actual gaps, rim, "
             "or other open boundaries."
         ),
@@ -464,77 +478,13 @@ def boundary_spill_proximity(boundary_points_native, spill_points_native, unit, 
     }
 
 # ----------------------------------------------------------------------
-# Stage A: PyMeshLab QA and conservative preprocessing
+# Stage A: deterministic preprocessing + optional PyMeshLab cross-check
 # ----------------------------------------------------------------------
-
-def pml_filter(ms, filter_name: str, **kwargs):
-    """
-    PyMeshLab filter compatibility wrapper.
-
-    PyMeshLab releases differ in how MeshLab filters are exposed:
-    - newer releases may expose generated methods such as
-      ms.get_topological_measures()
-    - other releases expose the same filter through
-      ms.apply_filter("get_topological_measures")
-
-    The generic apply_filter route is used as a fallback.
-    """
-    direct = getattr(ms, filter_name, None)
-    if callable(direct):
-        return direct(**kwargs)
-
-    apply_filter = getattr(ms, "apply_filter", None)
-    if callable(apply_filter):
-        return apply_filter(filter_name, **kwargs)
-
-    raise RuntimeError(
-        "PyMeshLab filter APIを利用できません。\n"
-        f"filter: {filter_name}\n"
-        "MeshSetに直接filter methodもapply_filter()もありません。"
-    )
-
-
-def pml_filter_api_mode(ms, filter_name: str) -> str:
-    if callable(getattr(ms, filter_name, None)):
-        return "direct method"
-    if callable(getattr(ms, "apply_filter", None)):
-        return "apply_filter"
-    return "unavailable"
-
-
-def topology_summary(measures: dict) -> dict:
-    """
-    get_topological_measures() の主要項目を抽出。
-    キーが存在しないバージョンでも raw 辞書は別途保存する。
-    """
-    keys = [
-        "vertices_number",
-        "faces_number",
-        "edges_number",
-        "boundary_edges",
-        "connected_components_number",
-        "is_mesh_two_manifold",
-        "non_two_manifold_edges",
-        "non_two_manifold_vertices",
-        "incident_faces_on_non_two_manifold_edges",
-        "incident_faces_on_non_two_manifold_vertices",
-        "unreferenced_vertices",
-        "number_holes",
-        "genus",
-    ]
-    return {k: jsonable(measures.get(k)) for k in keys if k in measures}
-
 
 def load_mesh_arrays_with_trimesh(input_path: Path):
     """
-    ファイルI/OはTrimeshに担当させる。
-
-    PyMeshLabのload_new_mesh()は環境によってI/O pluginが読み込まれず
-    "Unknown format for load: ply" になる場合があるため、v1.0.1以降は
-    PyMeshLabにはファイルを直接読ませない。
-
-    process=False により、読み込み時の自動頂点統合等を避ける。
-    Sceneになった場合はgeometryを単一メッシュへ結合する。
+    File I/O is handled only by Trimesh.
+    process=False prevents automatic topology edits during loading.
     """
     loaded = trimesh.load(
         str(input_path),
@@ -554,166 +504,570 @@ def load_mesh_arrays_with_trimesh(input_path: Path):
         loaded = trimesh.util.concatenate(geometries)
 
     if not isinstance(loaded, trimesh.Trimesh):
-        raise TypeError(
-            f"Trimeshとして読み込めませんでした: {type(loaded)}"
-        )
+        raise TypeError(f"Trimeshとして読み込めませんでした: {type(loaded)}")
 
     if len(loaded.vertices) == 0 or len(loaded.faces) == 0:
         raise ValueError("入力メッシュに頂点または三角形faceがありません。")
 
     vertices = np.asarray(loaded.vertices, dtype=np.float64).copy()
-    faces = np.asarray(loaded.faces, dtype=np.int32).copy()
+    faces = np.asarray(loaded.faces, dtype=np.int64).copy()
+
+    if not np.isfinite(vertices).all():
+        raise ValueError("入力メッシュの頂点座標に NaN または Inf があります。")
+    if faces.min() < 0 or faces.max() >= len(vertices):
+        raise ValueError("face index が頂点配列の範囲外です。")
 
     return vertices, faces
 
 
-def pymeshlab_preprocess(
+def deterministic_exact_vertex_cleanup(vertices, faces):
+    """
+    Exact-coordinate vertex welding implemented only with NumPy.
+
+    - Removes unreferenced vertices.
+    - Merges only vertices whose XYZ values are exactly equal.
+    - Does NOT merge merely close vertices.
+    - Does NOT move any vertex.
+    - Does NOT remove or add faces.
+
+    Vertex ordering follows the first occurrence in the referenced input set.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+
+    referenced_ids = np.unique(faces.reshape(-1))
+    referenced_vertices = vertices[referenced_ids]
+
+    unique_sorted, first_idx, inverse_sorted = np.unique(
+        referenced_vertices,
+        axis=0,
+        return_index=True,
+        return_inverse=True,
+    )
+
+    # Preserve first-occurrence order rather than np.unique's lexicographic order.
+    first_order = np.argsort(first_idx)
+    unique_vertices = unique_sorted[first_order]
+
+    sorted_to_first_order = np.empty(len(first_order), dtype=np.int64)
+    sorted_to_first_order[first_order] = np.arange(len(first_order), dtype=np.int64)
+    inverse_first_order = sorted_to_first_order[inverse_sorted]
+
+    old_to_new = np.full(len(vertices), -1, dtype=np.int64)
+    old_to_new[referenced_ids] = inverse_first_order
+    new_faces = old_to_new[faces]
+
+    # Strong geometry-preservation check:
+    # every referenced old vertex must map to exactly the same XYZ.
+    mapped_back = unique_vertices[old_to_new[referenced_ids]]
+    geometry_preserved_exact = bool(
+        np.array_equal(referenced_vertices, mapped_back, equal_nan=True)
+    )
+
+    if not geometry_preserved_exact:
+        raise RuntimeError("exact vertex weld の幾何座標保存検証に失敗しました。")
+
+    report = {
+        "input_vertices": int(len(vertices)),
+        "input_faces": int(len(faces)),
+        "referenced_vertices": int(len(referenced_ids)),
+        "unreferenced_vertices_removed": int(len(vertices) - len(referenced_ids)),
+        "exact_duplicate_vertices_removed": int(len(referenced_ids) - len(unique_vertices)),
+        "output_vertices": int(len(unique_vertices)),
+        "output_faces": int(len(new_faces)),
+        "faces_added_or_removed": int(len(new_faces) - len(faces)),
+        "geometry_preserved_exact": geometry_preserved_exact,
+        "coordinate_tolerance": 0.0,
+        "vertex_positions_moved": False,
+    }
+
+    return unique_vertices, new_faces, report
+
+
+def topology_summary_from_arrays(vertices, faces):
+    """
+    Deterministic topology summary based on edge incidence.
+
+    This is the reference QA used by the calculator; it does not depend on
+    PyMeshLab plugin availability.
+    """
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(vertices, dtype=np.float64),
+        faces=np.asarray(faces, dtype=np.int64),
+        process=False,
+        validate=False,
+    )
+
+    edges = np.sort(
+        np.vstack([
+            mesh.faces[:, [0, 1]],
+            mesh.faces[:, [1, 2]],
+            mesh.faces[:, [2, 0]],
+        ]),
+        axis=1,
+    )
+    unique_edges, counts = np.unique(edges, axis=0, return_counts=True)
+
+    boundary_mask = counts == 1
+    nonmanifold_mask = counts > 2
+    boundary_edges = unique_edges[boundary_mask]
+    nonmanifold_edges = unique_edges[nonmanifold_mask]
+
+    referenced = np.unique(mesh.faces.reshape(-1))
+    components = face_components(mesh)
+
+    # A 2-manifold with boundary permits edge incidence 1 or 2;
+    # a closed 2-manifold requires every edge incidence exactly 2.
+    is_two_manifold_edges = bool(np.all(counts <= 2))
+    is_closed_two_manifold = bool(np.all(counts == 2))
+
+    if len(nonmanifold_edges):
+        nonmanifold_vertices = np.unique(nonmanifold_edges.reshape(-1))
+    else:
+        nonmanifold_vertices = np.empty(0, dtype=np.int64)
+
+    return {
+        "vertices_number": int(len(mesh.vertices)),
+        "faces_number": int(len(mesh.faces)),
+        "edges_number": int(len(unique_edges)),
+        "boundary_edges": int(np.count_nonzero(boundary_mask)),
+        "connected_components_number": int(len(components)),
+        "is_mesh_two_manifold": is_two_manifold_edges,
+        "is_closed_two_manifold": is_closed_two_manifold,
+        "non_two_manifold_edges": int(np.count_nonzero(nonmanifold_mask)),
+        "non_two_manifold_vertices": int(len(nonmanifold_vertices)),
+        "unreferenced_vertices": int(len(mesh.vertices) - len(referenced)),
+        "winding_consistent_trimesh": bool(mesh.is_winding_consistent),
+        "watertight_trimesh": bool(mesh.is_watertight),
+    }
+
+
+def get_installed_version(distribution_name: str):
+    try:
+        return importlib_metadata.version(distribution_name)
+    except Exception:
+        return None
+
+
+def pymeshlab_loaded_filter_names(ms=None):
+    """
+    Returns only filters we can positively verify as loaded.
+
+    We never call apply_filter blindly. This is important because apply_filter
+    itself may exist even when a particular plugin/filter is not loaded.
+    """
+    names = set()
+
+    if pymeshlab is None:
+        return names, "unavailable"
+
+    module_filter_list = getattr(pymeshlab, "filter_list", None)
+    if callable(module_filter_list):
+        try:
+            names.update(str(x) for x in module_filter_list())
+            return names, "pymeshlab.filter_list"
+        except Exception:
+            pass
+
+    if ms is not None:
+        # Newer generated filter methods, when loaded, appear as MeshSet methods.
+        for name in (
+            "get_topological_measures",
+            "meshing_remove_duplicate_vertices",
+            "meshing_remove_unreferenced_vertices",
+        ):
+            if callable(getattr(ms, name, None)):
+                names.add(name)
+
+        # Older releases may only expose print_filter_list().
+        printer = getattr(ms, "print_filter_list", None)
+        if callable(printer):
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    printer()
+                text = buf.getvalue()
+                for name in (
+                    "get_topological_measures",
+                    "meshing_remove_duplicate_vertices",
+                    "meshing_remove_unreferenced_vertices",
+                ):
+                    if name in text:
+                        names.add(name)
+                if names:
+                    return names, "MeshSet.print_filter_list"
+            except Exception:
+                pass
+
+    return names, "direct-method inspection"
+
+
+def pymeshlab_call_verified(ms, filter_name, loaded_filters, **kwargs):
+    """
+    Call a PyMeshLab filter ONLY after confirming that it is loaded.
+    """
+    if filter_name not in loaded_filters:
+        raise RuntimeError(f"PyMeshLab filter not loaded: {filter_name}")
+
+    direct = getattr(ms, filter_name, None)
+    if callable(direct):
+        return direct(**kwargs)
+
+    apply_filter = getattr(ms, "apply_filter", None)
+    if callable(apply_filter):
+        return apply_filter(filter_name, **kwargs)
+
+    raise RuntimeError(
+        f"PyMeshLab filterはロード済みですが呼び出しAPIがありません: {filter_name}"
+    )
+
+
+def pymeshlab_environment_report():
+    report = {
+        "available": pymeshlab is not None,
+        "import_error": PYMESHLAB_IMPORT_ERROR,
+        "version": get_installed_version("pymeshlab"),
+        "plugins_loaded": None,
+        "filter_list_api_available": False,
+        "loaded_filter_count": None,
+        "required_filters": {},
+    }
+
+    if pymeshlab is None:
+        return report
+
+    number_plugins = getattr(pymeshlab, "number_plugins", None)
+    if callable(number_plugins):
+        try:
+            report["plugins_loaded"] = int(number_plugins())
+        except Exception as exc:
+            report["plugins_loaded_error"] = repr(exc)
+
+    report["filter_list_api_available"] = bool(
+        callable(getattr(pymeshlab, "filter_list", None))
+    )
+
+    # Inspect module-level list and, for older releases, MeshSet methods/list.
+    try:
+        probe_ms = pymeshlab.MeshSet()
+    except Exception:
+        probe_ms = None
+    names, source = pymeshlab_loaded_filter_names(probe_ms)
+    if names:
+        report["loaded_filter_count"] = int(len(names))
+    report["filter_discovery_source"] = source
+
+    for name in (
+        "get_topological_measures",
+        "meshing_remove_duplicate_vertices",
+        "meshing_remove_unreferenced_vertices",
+    ):
+        report["required_filters"][name] = bool(name in names)
+
+    return report
+
+
+def pymeshlab_crosscheck(
+    vertices_before,
+    faces_before,
+    reference_before,
+    vertices_after,
+    faces_after,
+    reference_after,
+    qa_dir: Path,
+    require_pymeshlab: bool = False,
+):
+    """
+    Optional independent cross-check.
+
+    The calculation mesh NEVER comes from PyMeshLab in v1.2.
+    PyMeshLab is allowed only to check the deterministic baseline.
+    """
+    env = pymeshlab_environment_report()
+    report = {
+        "environment": env,
+        "status": "unavailable",
+        "used_for_calculation_mesh": False,
+        "topology_before": None,
+        "topology_after": None,
+        "cleanup_crosscheck": None,
+        "synthetic_smoke_test": None,
+        "errors": [],
+    }
+
+    if pymeshlab is None:
+        write_json(qa_dir / "pymeshlab_crosscheck.json", report)
+        if require_pymeshlab:
+            raise RuntimeError(
+                "PyMeshLabが利用できません。--require-pymeshlab が指定されています。"
+            )
+        return report
+
+    try:
+        pm_mesh = pymeshlab.Mesh(
+            vertex_matrix=np.asarray(vertices_before, dtype=np.float64),
+            face_matrix=np.asarray(faces_before, dtype=np.int32),
+        )
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pm_mesh, "input_crosscheck")
+    except Exception as exc:
+        report["status"] = "mesh_construction_failed"
+        report["errors"].append(repr(exc))
+        write_json(qa_dir / "pymeshlab_crosscheck.json", report)
+        if require_pymeshlab:
+            raise RuntimeError(f"PyMeshLab mesh construction failed: {exc}")
+        return report
+
+    loaded_filters, discovery_source = pymeshlab_loaded_filter_names(ms)
+    report["environment"]["filter_discovery_source"] = discovery_source
+    report["environment"]["loaded_filter_count"] = int(len(loaded_filters))
+    for name in report["environment"]["required_filters"]:
+        report["environment"]["required_filters"][name] = bool(
+            name in loaded_filters
+        )
+
+    # Topological measures, if actually loaded.
+    topo_name = "get_topological_measures"
+    if topo_name in loaded_filters:
+        try:
+            topo_before = pymeshlab_call_verified(
+                ms, topo_name, loaded_filters
+            )
+            report["topology_before"] = jsonable(topo_before)
+        except Exception as exc:
+            report["errors"].append(
+                f"get_topological_measures(before): {exc!r}"
+            )
+
+    # Cleanup cross-check, if both filters are actually loaded.
+    dup_name = "meshing_remove_duplicate_vertices"
+    unref_name = "meshing_remove_unreferenced_vertices"
+    if dup_name in loaded_filters and unref_name in loaded_filters:
+        try:
+            ms_clean = pymeshlab.MeshSet()
+            ms_clean.add_mesh(
+                pymeshlab.Mesh(
+                    vertex_matrix=np.asarray(vertices_before, dtype=np.float64),
+                    face_matrix=np.asarray(faces_before, dtype=np.int32),
+                ),
+                "cleanup_crosscheck",
+            )
+
+            pymeshlab_call_verified(ms_clean, dup_name, loaded_filters)
+            pymeshlab_call_verified(ms_clean, unref_name, loaded_filters)
+
+            pm_after = ms_clean.current_mesh()
+            compact = getattr(pm_after, "compact", None)
+            if callable(compact):
+                compact()
+
+            pml_vertices = np.asarray(
+                pm_after.vertex_matrix(), dtype=np.float64
+            ).copy()
+            pml_faces = np.asarray(
+                pm_after.face_matrix(), dtype=np.int64
+            ).copy()
+
+            pml_topology = topology_summary_from_arrays(
+                pml_vertices, pml_faces
+            )
+            report["cleanup_crosscheck"] = {
+                "pymeshlab_vertices": int(len(pml_vertices)),
+                "pymeshlab_faces": int(len(pml_faces)),
+                "reference_vertices": int(len(vertices_after)),
+                "reference_faces": int(len(faces_after)),
+                "vertex_count_matches_reference": bool(
+                    len(pml_vertices) == len(vertices_after)
+                ),
+                "face_count_matches_reference": bool(
+                    len(pml_faces) == len(faces_after)
+                ),
+                "pymeshlab_topology_after_cleanup": pml_topology,
+                "reference_topology_after_cleanup": reference_after,
+            }
+
+            if topo_name in loaded_filters:
+                try:
+                    report["topology_after"] = jsonable(
+                        pymeshlab_call_verified(
+                            ms_clean, topo_name, loaded_filters
+                        )
+                    )
+                except Exception as exc:
+                    report["errors"].append(
+                        f"get_topological_measures(after): {exc!r}"
+                    )
+
+            # Synthetic smoke test for the duplicate-removal plugin.
+            sv = np.array([
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],  # duplicate of vertex 1
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],  # duplicate of vertex 2
+            ], dtype=np.float64)
+            sf = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+
+            sms = pymeshlab.MeshSet()
+            sms.add_mesh(
+                pymeshlab.Mesh(vertex_matrix=sv, face_matrix=sf),
+                "synthetic_duplicate_test",
+            )
+            before_n = int(sms.current_mesh().vertex_number())
+            pymeshlab_call_verified(sms, dup_name, loaded_filters)
+            pymeshlab_call_verified(sms, unref_name, loaded_filters)
+            after_n = int(sms.current_mesh().vertex_number())
+
+            report["synthetic_smoke_test"] = {
+                "input_vertices": before_n,
+                "output_vertices": after_n,
+                "expected_output_vertices": 4,
+                "passed": bool(after_n == 4),
+            }
+
+        except Exception as exc:
+            report["errors"].append(f"cleanup cross-check: {exc!r}")
+
+    required_available = all(
+        report["environment"]["required_filters"].values()
+    )
+    smoke_ok = (
+        report["synthetic_smoke_test"] is None
+        or report["synthetic_smoke_test"].get("passed", False)
+    )
+
+    if required_available and not report["errors"] and smoke_ok:
+        report["status"] = "fully_available_and_passed"
+    elif loaded_filters:
+        report["status"] = "partial_or_failed"
+    else:
+        report["status"] = "plugins_or_required_filters_unavailable"
+
+    write_json(qa_dir / "pymeshlab_crosscheck.json", report)
+
+    if require_pymeshlab and report["status"] != "fully_available_and_passed":
+        raise RuntimeError(
+            "PyMeshLab cross-checkが完全成功しませんでした。"
+            "qa/pymeshlab_crosscheck.json を確認してください。"
+        )
+
+    return report
+
+
+def stage_a_preprocess(
     input_path: Path,
     processed_dir: Path,
     qa_dir: Path,
     archaeological_dir: Path,
     unit: str,
     boundary_sample_mm: float,
+    require_pymeshlab: bool = False,
 ):
     """
-    Stage A:
-      1. TrimeshでPLY/OBJをprocess=Falseで読み込む
-      2. 頂点・face配列からPyMeshLab Meshを構築
-      3. PyMeshLabでQA
-      4. 完全同一座標のduplicate vertexとunreferenced vertexのみ除去
-      5. 処理後配列を取り出し、TrimeshでPLY保存
-
-    PyMeshLabのファイルI/O pluginには依存しない。
-
-    幾何形状を変更しうる以下は自動実行しない:
-    - Close Holes
-    - Merge Close Vertices
-    - Repair non-manifold edges/vertices
+    Reference preprocessing:
+      1. Trimesh file I/O, process=False
+      2. Preserve raw archaeological boundary derivatives
+      3. Deterministic raw topology QA
+      4. NumPy exact-coordinate weld + unreferenced removal
+      5. Deterministic post-weld topology QA
+      6. Optional PyMeshLab cross-check ONLY
     """
     vertices_before, faces_before = load_mesh_arrays_with_trimesh(input_path)
 
-    # Preserve raw boundary information BEFORE any cleanup.
     raw_boundary_stats, raw_boundary_samples = export_boundary_products(
-        vertices_before, faces_before, archaeological_dir, unit,
-        prefix="raw", sample_spacing_mm=boundary_sample_mm
+        vertices_before,
+        faces_before,
+        archaeological_dir,
+        unit,
+        prefix="raw",
+        sample_spacing_mm=boundary_sample_mm,
     )
 
-    # Official PyMeshLab array-import route:
-    # pymeshlab.Mesh(vertex_matrix=..., face_matrix=...)
-    pm_mesh = pymeshlab.Mesh(
-        vertex_matrix=vertices_before,
-        face_matrix=faces_before,
+    topology_before = topology_summary_from_arrays(
+        vertices_before, faces_before
+    )
+    write_json(qa_dir / "topology_before_exact_weld.json", topology_before)
+
+    vertices_after, faces_after, cleanup = deterministic_exact_vertex_cleanup(
+        vertices_before, faces_before
     )
 
-    ms = pymeshlab.MeshSet()
-    ms.add_mesh(pm_mesh, input_path.stem)
+    topology_after = topology_summary_from_arrays(
+        vertices_after, faces_after
+    )
+    write_json(qa_dir / "topology_after_exact_weld.json", topology_after)
+    write_json(qa_dir / "exact_weld_report.json", cleanup)
 
-    pml_api = {
-        "get_topological_measures": pml_filter_api_mode(
-            ms, "get_topological_measures"
-        ),
-        "meshing_remove_duplicate_vertices": pml_filter_api_mode(
-            ms, "meshing_remove_duplicate_vertices"
-        ),
-        "meshing_remove_unreferenced_vertices": pml_filter_api_mode(
-            ms, "meshing_remove_unreferenced_vertices"
-        ),
-    }
-
-    mesh_before = ms.current_mesh()
-    before_counts = {
-        "vertices": int(mesh_before.vertex_number()),
-        "faces": int(mesh_before.face_number()),
-    }
-
-    topo_before_raw = pml_filter(ms, "get_topological_measures")
-    topo_before = {
-        "counts": before_counts,
-        "summary": topology_summary(topo_before_raw),
-        "raw": jsonable(topo_before_raw),
-        "file_io": "Trimesh -> NumPy arrays -> PyMeshLab Mesh",
-        "filter_api": pml_api,
-    }
-    write_json(qa_dir / "pymeshlab_before.json", topo_before)
-
-    # Conservative preprocessing only.
-    pml_filter(ms, "meshing_remove_duplicate_vertices")
-    pml_filter(ms, "meshing_remove_unreferenced_vertices")
-
-    mesh_after = ms.current_mesh()
-
-    # Matrix extraction prefers a compact mesh when supported.
-    compact_method = getattr(mesh_after, "compact", None)
-    if callable(compact_method):
-        compact_method()
-
-    after_counts = {
-        "vertices": int(mesh_after.vertex_number()),
-        "faces": int(mesh_after.face_number()),
-    }
-
-    topo_after_raw = pml_filter(ms, "get_topological_measures")
-    topo_after = {
-        "counts": after_counts,
-        "summary": topology_summary(topo_after_raw),
-        "raw": jsonable(topo_after_raw),
-        "operations": [
-            "meshing_remove_duplicate_vertices",
-            "meshing_remove_unreferenced_vertices",
-        ],
-        "geometry_changing_repairs_applied": False,
-        "file_io": "PyMeshLab Mesh -> NumPy arrays -> Trimesh export",
-    }
-    write_json(qa_dir / "pymeshlab_after.json", topo_after)
-
-    vertices_native = np.asarray(
-        mesh_after.vertex_matrix(),
-        dtype=np.float64,
-    ).copy()
-    faces = np.asarray(
-        mesh_after.face_matrix(),
-        dtype=np.int64,
-    ).copy()
-
-    # Preserve boundary information AFTER duplicate/unreferenced removal.
     cleaned_boundary_stats, cleaned_boundary_samples = export_boundary_products(
-        vertices_native, faces, archaeological_dir, unit,
-        prefix="after_duplicate_removal", sample_spacing_mm=boundary_sample_mm
-    )
-    boundary_comparison = export_boundary_comparison(
-        archaeological_dir, raw_boundary_stats, cleaned_boundary_stats,
-        vertices_removed=before_counts["vertices"] - after_counts["vertices"]
+        vertices_after,
+        faces_after,
+        archaeological_dir,
+        unit,
+        prefix="after_exact_weld",
+        sample_spacing_mm=boundary_sample_mm,
     )
 
-    # Save with Trimesh, not PyMeshLab, to avoid PyMeshLab I/O plugin issues.
-    cleaned_path = processed_dir / f"{input_path.stem}_pymeshlab_cleaned.ply"
-    cleaned_mesh = trimesh.Trimesh(
-        vertices=vertices_native,
-        faces=faces,
+    boundary_comparison = export_boundary_comparison(
+        archaeological_dir,
+        raw_boundary_stats,
+        cleaned_boundary_stats,
+        vertices_removed=(
+            cleanup["exact_duplicate_vertices_removed"]
+            + cleanup["unreferenced_vertices_removed"]
+        ),
+    )
+
+    cleaned_path = processed_dir / f"{input_path.stem}_exact_welded.ply"
+    trimesh.Trimesh(
+        vertices=vertices_after,
+        faces=faces_after,
         process=False,
         validate=False,
+    ).export(str(cleaned_path))
+
+    pml_report = pymeshlab_crosscheck(
+        vertices_before=vertices_before,
+        faces_before=faces_before,
+        reference_before=topology_before,
+        vertices_after=vertices_after,
+        faces_after=faces_after,
+        reference_after=topology_after,
+        qa_dir=qa_dir,
+        require_pymeshlab=require_pymeshlab,
     )
-    cleaned_mesh.export(str(cleaned_path))
 
     report = {
-        "before": topo_before,
-        "after": topo_after,
+        "reference_engine": "NumPy + Trimesh",
+        "before": {
+            "counts": {
+                "vertices": int(len(vertices_before)),
+                "faces": int(len(faces_before)),
+            },
+            "summary": topology_before,
+        },
+        "after": {
+            "counts": {
+                "vertices": int(len(vertices_after)),
+                "faces": int(len(faces_after)),
+            },
+            "summary": topology_after,
+        },
+        "cleanup": cleanup,
         "vertices_removed": int(
-            before_counts["vertices"] - after_counts["vertices"]
+            cleanup["exact_duplicate_vertices_removed"]
+            + cleanup["unreferenced_vertices_removed"]
         ),
-        "faces_changed": int(
-            after_counts["faces"] - before_counts["faces"]
-        ),
+        "faces_changed": int(len(faces_after) - len(faces_before)),
         "processed_mesh": str(cleaned_path),
         "input_reader": "trimesh",
-        "qa_engine": "pymeshlab",
         "processed_mesh_writer": "trimesh",
-        "pymeshlab_file_io_used": False,
-        "pymeshlab_filter_api": pml_api,
+        "pymeshlab_crosscheck": pml_report,
         "raw_boundary": raw_boundary_stats,
-        "after_duplicate_removal_boundary": cleaned_boundary_stats,
+        "after_exact_weld_boundary": cleaned_boundary_stats,
         "boundary_comparison": boundary_comparison,
     }
+    write_json(qa_dir / "preprocessing_summary.json", report)
 
     archaeological = {
         "raw_boundary_stats": raw_boundary_stats,
@@ -723,7 +1077,55 @@ def pymeshlab_preprocess(
         "cleaned_boundary_samples_native": cleaned_boundary_samples,
     }
 
-    return vertices_native, faces, report, archaeological
+    return vertices_after, faces_after, report, archaeological
+
+
+def environment_diagnostics():
+    """Return runtime diagnostics without requiring an input mesh."""
+    report = {
+        "program_version": __version__,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "packages": {
+            "numpy": get_installed_version("numpy"),
+            "scipy": get_installed_version("scipy"),
+            "trimesh": get_installed_version("trimesh"),
+            "Pillow": get_installed_version("Pillow"),
+            "pymeshlab": get_installed_version("pymeshlab"),
+        },
+        "pymeshlab": pymeshlab_environment_report(),
+    }
+    return report
+
+
+def print_environment_diagnostics():
+    report = environment_diagnostics()
+    print(f"PotteryVolumeCalculator {__version__}")
+    print(f"Python       : {sys.version.split()[0]}")
+    print(f"Platform     : {report['platform']}")
+    for k, v in report["packages"].items():
+        print(f"{k:12s}: {v or 'not installed'}")
+
+    pml = report["pymeshlab"]
+    print("\nPyMeshLab")
+    print(f"  import available : {pml['available']}")
+    print(f"  plugins loaded   : {pml.get('plugins_loaded')}")
+    print(f"  filter_list API  : {pml.get('filter_list_api_available')}")
+    for name, available in pml.get("required_filters", {}).items():
+        print(f"  {name}: {available}")
+
+    if not pml["available"]:
+        print(
+            "\nNOTE: PyMeshLabは利用できませんが、"
+            "v1.2では容量計算の必須依存ではありません。"
+        )
+    elif not all(pml.get("required_filters", {}).values()):
+        print(
+            "\nNOTE: PyMeshLabの必要フィルタがロードされていません。"
+            "本体はNumPy/Trimesh基準QAで継続できます。"
+        )
+
+    return report
 
 
 # ----------------------------------------------------------------------
@@ -1098,6 +1500,7 @@ def estimate_volume(
     output_dir: Path | None,
     debug_voxels: bool,
     boundary_sample_mm: float,
+    require_pymeshlab: bool = False,
 ):
     started = time.perf_counter()
 
@@ -1114,19 +1517,20 @@ def estimate_volume(
     print(f"=== PotteryVolumeCalculator v{__version__} ===")
     print(f"output dir : {layout['base']}")
 
-    # ---- Stage A: PyMeshLab ----
-    print("\n=== Stage A: PyMeshLab QA / preprocessing ===")
-    print("file I/O   : Trimesh")
-    print("QA engine  : PyMeshLab (NumPy array import)")
-    print("filter API : auto (direct method / apply_filter compatibility)")
+    # ---- Stage A: deterministic preprocessing + optional PyMeshLab ----
+    print("\n=== Stage A: deterministic QA / exact-coordinate weld ===")
+    print("file I/O       : Trimesh (process=False)")
+    print("reference QA   : NumPy + Trimesh")
+    print("calculation mesh: exact-coordinate weld only")
     tp = time.perf_counter()
-    vertices_native, faces, pml_report, archaeological = pymeshlab_preprocess(
+    vertices_native, faces, pml_report, archaeological = stage_a_preprocess(
         input_path,
         processed_dir=layout["processed"],
         qa_dir=layout["qa"],
         archaeological_dir=layout["archaeological"],
         unit=unit,
         boundary_sample_mm=boundary_sample_mm,
+        require_pymeshlab=require_pymeshlab,
     )
     pml_time = time.perf_counter() - tp
 
@@ -1135,14 +1539,24 @@ def estimate_volume(
 
     print(f"vertices before : {pml_report['before']['counts']['vertices']:,}")
     print(f"vertices after  : {pml_report['after']['counts']['vertices']:,}")
-    print(f"duplicate/unref removed: {pml_report['vertices_removed']:,}")
+    print(f"exact dup/unref removed: {pml_report['vertices_removed']:,}")
     print(f"boundary edges before: {before.get('boundary_edges', 'n/a')}")
     print(f"boundary edges after : {after.get('boundary_edges', 'n/a')}")
     print(f"components after     : {after.get('connected_components_number', 'n/a')}")
     print(f"2-manifold after     : {after.get('is_mesh_two_manifold', 'n/a')}")
+    print(f"closed 2-manifold    : {after.get('is_closed_two_manifold', 'n/a')}")
     print(f"non-2-manifold edges : {after.get('non_two_manifold_edges', 'n/a')}")
+    print(f"geometry preserved   : {pml_report['cleanup']['geometry_preserved_exact']}")
     print(f"time                  : {pml_time:.2f} s")
     print(f"processed mesh        : {pml_report['processed_mesh']}")
+
+    pml_cross = pml_report["pymeshlab_crosscheck"]
+    pml_env = pml_cross["environment"]
+    print("\n=== Stage A2: PyMeshLab independent cross-check ===")
+    print(f"PyMeshLab version : {pml_env.get('version') or 'not installed'}")
+    print(f"plugins loaded    : {pml_env.get('plugins_loaded')}")
+    print(f"cross-check status: {pml_cross.get('status')}")
+    print("used for calculation mesh: False")
     print(
         f"raw boundary edges    : "
         f"{archaeological['raw_boundary_stats']['boundary_edges']:,}"
@@ -1294,7 +1708,7 @@ def estimate_volume(
             "input_unit": unit,
             "pitch_mm": pitch,
             "output_directory": str(layout["base"]),
-            "pymeshlab_qa": pml_report,
+            "preprocessing_qa": pml_report,
             "archaeological_boundary_derivatives": {
                 "raw": archaeological["raw_boundary_stats"],
                 "after_duplicate_removal": archaeological["cleaned_boundary_stats"],
@@ -1480,7 +1894,7 @@ def estimate_volume(
             native_length(float(v), unit) for v in extents_mm
         ],
         "mesh_extents_native_unit": unit,
-        "pymeshlab_qa": pml_report,
+        "preprocessing_qa": pml_report,
         "archaeological_boundary_derivatives": {
             "raw": archaeological["raw_boundary_stats"],
             "after_duplicate_removal": archaeological["cleaned_boundary_stats"],
@@ -1504,7 +1918,7 @@ def estimate_volume(
         "volume_l": volume_l,
         "vertical_resolution_mm": pitch,
         "timing_seconds": {
-            "pymeshlab": pml_time,
+            "preprocessing": pml_time,
             "trimesh_qa": tm_time,
             "voxelization": voxelize_time,
             "seed_search": seed_time,
@@ -1531,7 +1945,7 @@ def estimate_volume(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "PyMeshLab QA + voxel spill-level法により、"
+            "deterministic QA + optional PyMeshLab cross-check + voxel spill-level法により、"
             "土器が液体を保持できる最大内容積を推定"
         )
     )
@@ -1540,7 +1954,20 @@ def main():
         action="version",
         version=f"%(prog)s {__version__}",
     )
-    parser.add_argument("input", type=Path, help="入力 OBJ または PLY")
+    parser.add_argument(
+        "--diagnose-env",
+        action="store_true",
+        help="Python/PyMeshLabの実行環境とロード済みプラグインを診断して終了",
+    )
+    parser.add_argument(
+        "--require-pymeshlab",
+        action="store_true",
+        help=(
+            "PyMeshLab cross-checkが完全成功しない場合にエラー終了する。"
+            "通常は指定不要"
+        ),
+    )
+    parser.add_argument("input", type=Path, nargs="?", help="入力 OBJ または PLY")
     parser.add_argument(
         "--unit",
         choices=["mm", "cm", "m"],
@@ -1606,6 +2033,13 @@ def main():
 
     args = parser.parse_args()
 
+    if args.diagnose_env:
+        print_environment_diagnostics()
+        return
+
+    if args.input is None:
+        parser.error("input OBJ/PLY が必要です（--diagnose-env の場合を除く）")
+
     try:
         estimate_volume(
             input_path=args.input,
@@ -1618,6 +2052,7 @@ def main():
             output_dir=args.output_dir,
             debug_voxels=args.debug_voxels,
             boundary_sample_mm=args.boundary_sample_mm,
+            require_pymeshlab=args.require_pymeshlab,
         )
     except ModuleNotFoundError as exc:
         dependency_error(exc)
