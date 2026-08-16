@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PotteryVolumeCalculator
-Version 1.0.0
+Version 1.1.0
 
 OBJ / PLY の土器メッシュから、内面を明示的に抽出せず、
 「液体が最初に外へ溢れ出す直前までの最大内容量」を voxel 法で推定する。
@@ -17,6 +17,8 @@ v1 の主要方針
 6. spill直前までの空隙を最大保持液量として計算
 7. 出力PLYの座標単位は入力モデルと同じ単位へ戻す
 8. 出力ファイルは専用フォルダ内へ整理
+9. raw boundary edge を「破片境界候補」として別系統で保存
+10. duplicate removal 前後の boundary を比較し、spillとの近接も診断
 
 対象（v1）
 ----------
@@ -38,13 +40,15 @@ v1 の主要方針
 from __future__ import annotations
 
 import argparse
+import colorsys
+import csv
 import json
 import math
 import sys
 import time
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 # ----------------------------------------------------------------------
@@ -80,6 +84,7 @@ try:
     import pymeshlab
     import PIL  # noqa: F401  # trimesh の soft dependency 対策
     from scipy import ndimage
+    from scipy.spatial import cKDTree
 except ModuleNotFoundError as exc:
     dependency_error(exc)
 
@@ -153,17 +158,22 @@ def make_output_layout(
     else:
         base = Path(output_dir)
 
+    archaeological_dir = base / "archaeological"
     processed_dir = base / "processed"
     qa_dir = base / "qa"
     run_dir = base / pitch_label(pitch)
     run_qa_dir = run_dir / "qa"
     qc_dir = run_dir / "qc"
 
-    for p in (base, processed_dir, qa_dir, run_dir, run_qa_dir, qc_dir):
+    for p in (
+        base, archaeological_dir, processed_dir, qa_dir,
+        run_dir, run_qa_dir, qc_dir
+    ):
         p.mkdir(parents=True, exist_ok=True)
 
     return {
         "base": base,
+        "archaeological": archaeological_dir,
         "processed": processed_dir,
         "qa": qa_dir,
         "run": run_dir,
@@ -171,6 +181,287 @@ def make_output_layout(
         "qc": qc_dir,
     }
 
+
+
+# ----------------------------------------------------------------------
+# Archaeological derivative: raw fragment-boundary candidates
+# ----------------------------------------------------------------------
+
+def boundary_edges_from_arrays(vertices, faces):
+    """Trimesh topologyから1 faceだけに属するboundary edgeを取得。"""
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(vertices, dtype=np.float64),
+        faces=np.asarray(faces, dtype=np.int64),
+        process=False,
+        validate=False,
+    )
+    unique_edges = np.asarray(mesh.edges_unique, dtype=np.int64)
+    inverse = np.asarray(mesh.edges_unique_inverse, dtype=np.int64)
+    counts = np.bincount(inverse, minlength=len(unique_edges))
+    return mesh, unique_edges[counts == 1]
+
+
+def sample_edge_points(vertices, edges, spacing_native):
+    """
+    boundary edgeを線としてCloudCompareで見やすくするため等間隔サンプリング。
+    元メッシュの座標単位のまま返す。
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    edges = np.asarray(edges, dtype=np.int64)
+    if len(edges) == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    chunks = []
+    spacing_native = max(float(spacing_native), np.finfo(float).eps)
+    for a, b in edges:
+        p0 = vertices[a]
+        p1 = vertices[b]
+        length = float(np.linalg.norm(p1 - p0))
+        n = max(2, int(math.ceil(length / spacing_native)) + 1)
+        t = np.linspace(0.0, 1.0, n, endpoint=True)[:, None]
+        chunks.append(p0[None, :] * (1.0 - t) + p1[None, :] * t)
+    return np.vstack(chunks)
+
+
+def boundary_statistics(vertices, edges, unit):
+    vertices = np.asarray(vertices, dtype=np.float64)
+    edges = np.asarray(edges, dtype=np.int64)
+    if len(edges) == 0:
+        return {
+            "boundary_edges": 0,
+            "boundary_vertices": 0,
+            "total_boundary_length": 0.0,
+            "length_unit": unit,
+        }
+    seg = vertices[edges[:, 1]] - vertices[edges[:, 0]]
+    lengths = np.linalg.norm(seg, axis=1)
+    return {
+        "boundary_edges": int(len(edges)),
+        "boundary_vertices": int(len(np.unique(edges.reshape(-1)))),
+        "total_boundary_length": float(lengths.sum()),
+        "mean_edge_length": float(lengths.mean()),
+        "median_edge_length": float(np.median(lengths)),
+        "max_edge_length": float(lengths.max()),
+        "length_unit": unit,
+    }
+
+
+def face_components(mesh):
+    """
+    face adjacencyをUnion-Findで分割する。
+    raw meshでは接合線でトポロジーが切れていれば、破片候補componentとして残る。
+    """
+    n_faces = len(mesh.faces)
+    parent = np.arange(n_faces, dtype=np.int64)
+    rank = np.zeros(n_faces, dtype=np.int8)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(int(a)), find(int(b))
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    for a, b in np.asarray(mesh.face_adjacency, dtype=np.int64):
+        union(a, b)
+
+    groups = {}
+    for f in range(n_faces):
+        root = find(f)
+        groups.setdefault(root, []).append(f)
+    components = [np.asarray(v, dtype=np.int64) for v in groups.values()]
+    components.sort(key=len, reverse=True)
+    return components
+
+
+def component_color(index, total):
+    """component表示用の決定的なRGB色。解析値には使用しない。"""
+    hue = (index * 0.618033988749895) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.95)
+    return np.array([r, g, b, 1.0]) * 255.0
+
+
+def export_component_products(mesh, components, archaeological_dir, unit, prefix):
+    """component統計CSV/JSONと色分けPLYを保存する。"""
+    rows = []
+    face_colors = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
+
+    for i, face_ids in enumerate(components, start=1):
+        face_ids = np.asarray(face_ids, dtype=np.int64)
+        face_colors[face_ids] = component_color(i, len(components)).astype(np.uint8)
+        component_faces = np.asarray(mesh.faces)[face_ids]
+        vertex_ids = np.unique(component_faces.reshape(-1))
+        pts = np.asarray(mesh.vertices)[vertex_ids]
+        area = float(np.asarray(mesh.area_faces)[face_ids].sum())
+        centroid = pts.mean(axis=0)
+        bmin = pts.min(axis=0)
+        bmax = pts.max(axis=0)
+        rows.append({
+            "component_id": i,
+            "faces": int(len(face_ids)),
+            "vertices": int(len(vertex_ids)),
+            "surface_area": area,
+            "area_unit": f"{unit}^2",
+            "centroid_x": float(centroid[0]),
+            "centroid_y": float(centroid[1]),
+            "centroid_z": float(centroid[2]),
+            "bbox_min_x": float(bmin[0]),
+            "bbox_min_y": float(bmin[1]),
+            "bbox_min_z": float(bmin[2]),
+            "bbox_max_x": float(bmax[0]),
+            "bbox_max_y": float(bmax[1]),
+            "bbox_max_z": float(bmax[2]),
+            "length_unit": unit,
+        })
+
+    csv_path = archaeological_dir / f"{prefix}_components.csv"
+    if rows:
+        with csv_path.open('w', encoding='utf-8', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+
+    json_path = archaeological_dir / f"{prefix}_components.json"
+    write_json(json_path, {
+        "note": (
+            "Connected components are topology-derived fragment candidates; "
+            "they are not automatically asserted to be archaeological sherds."
+        ),
+        "component_count": len(rows),
+        "components": rows,
+    })
+
+    colored_path = archaeological_dir / f"{prefix}_components_colored.ply"
+    colored_mesh = mesh.copy()
+    colored_mesh.visual.face_colors = face_colors
+    colored_mesh.export(str(colored_path))
+
+    return {
+        "components_csv": str(csv_path),
+        "components_json": str(json_path),
+        "components_colored_ply": str(colored_path),
+        "component_count": int(len(rows)),
+    }
+
+
+def export_boundary_products(vertices, faces, archaeological_dir, unit, prefix,
+                             sample_spacing_mm=0.5):
+    """
+    boundaryを考古学的派生データとして保存。
+    sample_spacing_mmは入力単位へ変換して線上サンプルを作る。
+    """
+    mesh, edges = boundary_edges_from_arrays(vertices, faces)
+    scale = UNIT_SCALE_TO_MM[unit]
+    spacing_native = sample_spacing_mm / scale
+    stats = boundary_statistics(vertices, edges, unit)
+    stats["sample_spacing_mm"] = float(sample_spacing_mm)
+
+    vertex_path = archaeological_dir / f"{prefix}_boundary_vertices.ply"
+    sampled_path = archaeological_dir / f"{prefix}_boundaries_sampled.ply"
+    stats_path = archaeological_dir / f"{prefix}_boundary_stats.json"
+
+    if len(edges):
+        ids = np.unique(edges.reshape(-1))
+        trimesh.points.PointCloud(np.asarray(vertices)[ids]).export(str(vertex_path))
+        sampled = sample_edge_points(vertices, edges, spacing_native)
+        trimesh.points.PointCloud(sampled).export(str(sampled_path))
+    else:
+        sampled = np.empty((0, 3), dtype=np.float64)
+
+    component_info = export_component_products(
+        mesh, face_components(mesh), archaeological_dir, unit, prefix
+    )
+
+    stats.update({
+        "boundary_vertices_ply": str(vertex_path) if len(edges) else None,
+        "boundaries_sampled_ply": str(sampled_path) if len(edges) else None,
+        "sampled_points": int(len(sampled)),
+        **component_info,
+    })
+    write_json(stats_path, stats)
+    stats["boundary_stats_json"] = str(stats_path)
+    return stats, sampled
+
+
+def export_boundary_comparison(archaeological_dir, raw_stats, cleaned_stats,
+                               vertices_removed):
+    raw_edges = int(raw_stats.get("boundary_edges", 0))
+    cleaned_edges = int(cleaned_stats.get("boundary_edges", 0))
+    comparison = {
+        "raw_boundary_edges": raw_edges,
+        "after_duplicate_removal_boundary_edges": cleaned_edges,
+        "boundary_edges_removed": raw_edges - cleaned_edges,
+        "boundary_edges_remaining_fraction": (
+            cleaned_edges / raw_edges if raw_edges else None
+        ),
+        "raw_connected_components": raw_stats.get("component_count"),
+        "after_duplicate_removal_connected_components": cleaned_stats.get("component_count"),
+        "vertices_removed_by_pymeshlab": int(vertices_removed),
+        "interpretation": (
+            "Large reduction after duplicate removal suggests topological seams at "
+            "coincident geometry. Remaining boundaries may represent actual gaps, rim, "
+            "or other open boundaries."
+        ),
+    }
+    path = archaeological_dir / "boundary_before_after_comparison.json"
+    write_json(path, comparison)
+    comparison["comparison_json"] = str(path)
+    return comparison
+
+
+def export_colored_overlap(boundary_points_native, spill_points_native, path):
+    """raw fragment boundary候補とspill free-spaceを1つの色付きPLYに保存。"""
+    boundary_points_native = np.asarray(boundary_points_native, dtype=np.float64)
+    spill_points_native = np.asarray(spill_points_native, dtype=np.float64)
+    if len(boundary_points_native) == 0 or len(spill_points_native) == 0:
+        return 0
+    points = np.vstack([boundary_points_native, spill_points_native])
+    colors = np.vstack([
+        np.tile(np.array([[255, 60, 60, 255]], dtype=np.uint8), (len(boundary_points_native), 1)),
+        np.tile(np.array([[40, 180, 255, 255]], dtype=np.uint8), (len(spill_points_native), 1)),
+    ])
+    trimesh.points.PointCloud(points, colors=colors).export(str(path))
+    return int(len(points))
+
+
+def boundary_spill_proximity(boundary_points_native, spill_points_native, unit, pitch_mm):
+    """spill付近free voxelがraw boundary候補にどの程度近いかを定量化。"""
+    boundary_points_native = np.asarray(boundary_points_native, dtype=np.float64)
+    spill_points_native = np.asarray(spill_points_native, dtype=np.float64)
+    if len(boundary_points_native) == 0 or len(spill_points_native) == 0:
+        return {"available": False}
+
+    scale = UNIT_SCALE_TO_MM[unit]
+    boundary_mm = boundary_points_native * scale
+    spill_mm = spill_points_native * scale
+    tree = cKDTree(boundary_mm)
+    distances, _ = tree.query(spill_mm, k=1, workers=-1)
+    distances = np.asarray(distances, dtype=np.float64)
+    return {
+        "available": True,
+        "spill_points_evaluated": int(len(distances)),
+        "distance_min_mm": float(distances.min()),
+        "distance_median_mm": float(np.median(distances)),
+        "distance_p90_mm": float(np.percentile(distances, 90)),
+        "fraction_within_half_pitch": float(np.mean(distances <= 0.5 * pitch_mm)),
+        "fraction_within_one_pitch": float(np.mean(distances <= pitch_mm)),
+        "interpretation": (
+            "A high fraction within one voxel pitch means the detected spill path is "
+            "spatially close to raw boundary/seam candidates; this supports, but does "
+            "not by itself prove, seam-related leakage."
+        ),
+    }
 
 # ----------------------------------------------------------------------
 # Stage A: PyMeshLab QA and conservative preprocessing
@@ -199,22 +490,88 @@ def topology_summary(measures: dict) -> dict:
     return {k: jsonable(measures.get(k)) for k in keys if k in measures}
 
 
+def load_mesh_arrays_with_trimesh(input_path: Path):
+    """
+    ファイルI/OはTrimeshに担当させる。
+
+    PyMeshLabのload_new_mesh()は環境によってI/O pluginが読み込まれず
+    "Unknown format for load: ply" になる場合があるため、v1.0.1以降は
+    PyMeshLabにはファイルを直接読ませない。
+
+    process=False により、読み込み時の自動頂点統合等を避ける。
+    Sceneになった場合はgeometryを単一メッシュへ結合する。
+    """
+    loaded = trimesh.load(
+        str(input_path),
+        process=False,
+        force="mesh",
+    )
+
+    if isinstance(loaded, trimesh.Scene):
+        geometries = [
+            g for g in loaded.geometry.values()
+            if isinstance(g, trimesh.Trimesh)
+            and len(g.vertices) > 0
+            and len(g.faces) > 0
+        ]
+        if not geometries:
+            raise ValueError("入力ファイルから三角形メッシュを取得できませんでした。")
+        loaded = trimesh.util.concatenate(geometries)
+
+    if not isinstance(loaded, trimesh.Trimesh):
+        raise TypeError(
+            f"Trimeshとして読み込めませんでした: {type(loaded)}"
+        )
+
+    if len(loaded.vertices) == 0 or len(loaded.faces) == 0:
+        raise ValueError("入力メッシュに頂点または三角形faceがありません。")
+
+    vertices = np.asarray(loaded.vertices, dtype=np.float64).copy()
+    faces = np.asarray(loaded.faces, dtype=np.int32).copy()
+
+    return vertices, faces
+
+
 def pymeshlab_preprocess(
     input_path: Path,
     processed_dir: Path,
     qa_dir: Path,
+    archaeological_dir: Path,
+    unit: str,
+    boundary_sample_mm: float,
 ):
     """
-    PyMeshLabでQA後、完全同一座標のduplicate vertexと
-    unreferenced vertexのみ除去する。
+    Stage A:
+      1. TrimeshでPLY/OBJをprocess=Falseで読み込む
+      2. 頂点・face配列からPyMeshLab Meshを構築
+      3. PyMeshLabでQA
+      4. 完全同一座標のduplicate vertexとunreferenced vertexのみ除去
+      5. 処理後配列を取り出し、TrimeshでPLY保存
+
+    PyMeshLabのファイルI/O pluginには依存しない。
 
     幾何形状を変更しうる以下は自動実行しない:
     - Close Holes
     - Merge Close Vertices
     - Repair non-manifold edges/vertices
     """
+    vertices_before, faces_before = load_mesh_arrays_with_trimesh(input_path)
+
+    # Preserve raw boundary information BEFORE any cleanup.
+    raw_boundary_stats, raw_boundary_samples = export_boundary_products(
+        vertices_before, faces_before, archaeological_dir, unit,
+        prefix="raw", sample_spacing_mm=boundary_sample_mm
+    )
+
+    # Official PyMeshLab array-import route:
+    # pymeshlab.Mesh(vertex_matrix=..., face_matrix=...)
+    pm_mesh = pymeshlab.Mesh(
+        vertex_matrix=vertices_before,
+        face_matrix=faces_before,
+    )
+
     ms = pymeshlab.MeshSet()
-    ms.load_new_mesh(str(input_path))
+    ms.add_mesh(pm_mesh, input_path.stem)
 
     mesh_before = ms.current_mesh()
     before_counts = {
@@ -227,16 +584,17 @@ def pymeshlab_preprocess(
         "counts": before_counts,
         "summary": topology_summary(topo_before_raw),
         "raw": jsonable(topo_before_raw),
+        "file_io": "Trimesh -> NumPy arrays -> PyMeshLab Mesh",
     }
     write_json(qa_dir / "pymeshlab_before.json", topo_before)
 
-    # Conservative preprocessing only
+    # Conservative preprocessing only.
     ms.meshing_remove_duplicate_vertices()
     ms.meshing_remove_unreferenced_vertices()
 
     mesh_after = ms.current_mesh()
-    # vertex_matrix / face_matrix の取得前に配列をcompact化する。
-    # PyMeshLab公式APIではこれらのmatrix取得はcompact meshを前提とする。
+
+    # Matrix extraction requires compact mesh.
     mesh_after.compact()
 
     after_counts = {
@@ -254,25 +612,67 @@ def pymeshlab_preprocess(
             "meshing_remove_unreferenced_vertices",
         ],
         "geometry_changing_repairs_applied": False,
+        "file_io": "PyMeshLab Mesh -> NumPy arrays -> Trimesh export",
     }
     write_json(qa_dir / "pymeshlab_after.json", topo_after)
 
-    cleaned_path = processed_dir / f"{input_path.stem}_pymeshlab_cleaned.ply"
-    # PyMeshLab stays in the original/native input coordinate scale.
-    ms.save_current_mesh(str(cleaned_path), save_textures=False)
+    vertices_native = np.asarray(
+        mesh_after.vertex_matrix(),
+        dtype=np.float64,
+    ).copy()
+    faces = np.asarray(
+        mesh_after.face_matrix(),
+        dtype=np.int64,
+    ).copy()
 
-    vertices_native = np.asarray(mesh_after.vertex_matrix(), dtype=np.float64).copy()
-    faces = np.asarray(mesh_after.face_matrix(), dtype=np.int64).copy()
+    # Preserve boundary information AFTER duplicate/unreferenced removal.
+    cleaned_boundary_stats, cleaned_boundary_samples = export_boundary_products(
+        vertices_native, faces, archaeological_dir, unit,
+        prefix="after_duplicate_removal", sample_spacing_mm=boundary_sample_mm
+    )
+    boundary_comparison = export_boundary_comparison(
+        archaeological_dir, raw_boundary_stats, cleaned_boundary_stats,
+        vertices_removed=before_counts["vertices"] - after_counts["vertices"]
+    )
+
+    # Save with Trimesh, not PyMeshLab, to avoid PyMeshLab I/O plugin issues.
+    cleaned_path = processed_dir / f"{input_path.stem}_pymeshlab_cleaned.ply"
+    cleaned_mesh = trimesh.Trimesh(
+        vertices=vertices_native,
+        faces=faces,
+        process=False,
+        validate=False,
+    )
+    cleaned_mesh.export(str(cleaned_path))
 
     report = {
         "before": topo_before,
         "after": topo_after,
-        "vertices_removed": int(before_counts["vertices"] - after_counts["vertices"]),
-        "faces_changed": int(after_counts["faces"] - before_counts["faces"]),
+        "vertices_removed": int(
+            before_counts["vertices"] - after_counts["vertices"]
+        ),
+        "faces_changed": int(
+            after_counts["faces"] - before_counts["faces"]
+        ),
         "processed_mesh": str(cleaned_path),
+        "input_reader": "trimesh",
+        "qa_engine": "pymeshlab",
+        "processed_mesh_writer": "trimesh",
+        "pymeshlab_file_io_used": False,
+        "raw_boundary": raw_boundary_stats,
+        "after_duplicate_removal_boundary": cleaned_boundary_stats,
+        "boundary_comparison": boundary_comparison,
     }
 
-    return vertices_native, faces, report
+    archaeological = {
+        "raw_boundary_stats": raw_boundary_stats,
+        "cleaned_boundary_stats": cleaned_boundary_stats,
+        "boundary_comparison": boundary_comparison,
+        "raw_boundary_samples_native": raw_boundary_samples,
+        "cleaned_boundary_samples_native": cleaned_boundary_samples,
+    }
+
+    return vertices_native, faces, report, archaeological
 
 
 # ----------------------------------------------------------------------
@@ -646,6 +1046,7 @@ def estimate_volume(
     close_iterations: int,
     output_dir: Path | None,
     debug_voxels: bool,
+    boundary_sample_mm: float,
 ):
     started = time.perf_counter()
 
@@ -653,6 +1054,8 @@ def estimate_volume(
         raise ValueError("unit は mm / cm / m のいずれかを指定してください。")
     if pitch <= 0:
         raise ValueError("pitch は正数にしてください。")
+    if boundary_sample_mm <= 0:
+        raise ValueError("boundary-sample-mm は正数にしてください。")
 
     scale_to_mm = UNIT_SCALE_TO_MM[unit]
     layout = make_output_layout(input_path, pitch, output_dir)
@@ -662,11 +1065,16 @@ def estimate_volume(
 
     # ---- Stage A: PyMeshLab ----
     print("\n=== Stage A: PyMeshLab QA / preprocessing ===")
+    print("file I/O   : Trimesh")
+    print("QA engine  : PyMeshLab (NumPy array import)")
     tp = time.perf_counter()
-    vertices_native, faces, pml_report = pymeshlab_preprocess(
+    vertices_native, faces, pml_report, archaeological = pymeshlab_preprocess(
         input_path,
         processed_dir=layout["processed"],
         qa_dir=layout["qa"],
+        archaeological_dir=layout["archaeological"],
+        unit=unit,
+        boundary_sample_mm=boundary_sample_mm,
     )
     pml_time = time.perf_counter() - tp
 
@@ -683,6 +1091,19 @@ def estimate_volume(
     print(f"non-2-manifold edges : {after.get('non_two_manifold_edges', 'n/a')}")
     print(f"time                  : {pml_time:.2f} s")
     print(f"processed mesh        : {pml_report['processed_mesh']}")
+    print(
+        f"raw boundary edges    : "
+        f"{archaeological['raw_boundary_stats']['boundary_edges']:,}"
+    )
+    print(
+        f"after duplicate edges : "
+        f"{archaeological['cleaned_boundary_stats']['boundary_edges']:,}"
+    )
+    print(
+        f"raw components        : "
+        f"{archaeological['raw_boundary_stats']['component_count']:,}"
+    )
+    print(f"archaeological output : {layout['archaeological']}")
 
     # ---- Internal Trimesh in mm ----
     vertices_mm = vertices_native * scale_to_mm
@@ -822,6 +1243,11 @@ def estimate_volume(
             "pitch_mm": pitch,
             "output_directory": str(layout["base"]),
             "pymeshlab_qa": pml_report,
+            "archaeological_boundary_derivatives": {
+                "raw": archaeological["raw_boundary_stats"],
+                "after_duplicate_removal": archaeological["cleaned_boundary_stats"],
+                "comparison": archaeological["boundary_comparison"],
+            },
             "trimesh_qa": tm_report,
             "voxel_qa": voxel_qa,
         }
@@ -941,6 +1367,34 @@ def estimate_volume(
         print(f"spill slab wall: {slab_surface_path}")
         print(f"spill slab free: {slab_free_path}")
 
+        # Quantify and visualize relation between spill path and raw fragment boundaries.
+        slab_free_indices = np.argwhere(slab_free)
+        spill_free_native = (
+            padded_indices_to_points_mm(vox, slab_free_indices, pad) / scale_to_mm
+            if len(slab_free_indices) else np.empty((0, 3), dtype=np.float64)
+        )
+        raw_boundary_samples = archaeological["raw_boundary_samples_native"]
+        proximity = boundary_spill_proximity(
+            raw_boundary_samples, spill_free_native, unit, pitch
+        )
+        proximity_path = layout["run_qa"] / "spill_boundary_proximity.json"
+        write_json(proximity_path, proximity)
+        qc_files["spill_boundary_proximity_json"] = str(proximity_path)
+
+        overlap_path = layout["qc"] / "spill_vs_raw_fragment_boundaries.ply"
+        overlap_count = export_colored_overlap(
+            raw_boundary_samples, spill_free_native, overlap_path
+        )
+        if overlap_count:
+            qc_files["spill_vs_raw_fragment_boundaries_ply"] = str(overlap_path)
+            print(f"spill vs seams : {overlap_path} ({overlap_count:,} points)")
+        if proximity.get("available"):
+            print(
+                "spill near raw boundary: "
+                f"<=0.5 pitch {proximity['fraction_within_half_pitch']:.3f}, "
+                f"<=1 pitch {proximity['fraction_within_one_pitch']:.3f}"
+            )
+
     voxel_qa.update({
         "safe_level_z_mm": safe_z_mm,
         "spill_level_z_mm": spill_z_mm,
@@ -975,6 +1429,11 @@ def estimate_volume(
         ],
         "mesh_extents_native_unit": unit,
         "pymeshlab_qa": pml_report,
+        "archaeological_boundary_derivatives": {
+            "raw": archaeological["raw_boundary_stats"],
+            "after_duplicate_removal": archaeological["cleaned_boundary_stats"],
+            "comparison": archaeological["boundary_comparison"],
+        },
         "trimesh_qa": tm_report,
         "voxel_qa": voxel_qa,
         "seed_index": [int(v) for v in seed_xyz],
@@ -1079,6 +1538,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--boundary-sample-mm",
+        type=float,
+        default=0.5,
+        help=(
+            "raw/cleaned boundaryを線として保存する際のサンプリング間隔 [mm]。"
+            "既定値 0.5。容量計算には影響しない"
+        ),
+    )
+    parser.add_argument(
         "--debug-voxels",
         action="store_true",
         help="surface voxel全体とspill付近スラブを常に出力",
@@ -1097,6 +1565,7 @@ def main():
             close_iterations=args.close_iters,
             output_dir=args.output_dir,
             debug_voxels=args.debug_voxels,
+            boundary_sample_mm=args.boundary_sample_mm,
         )
     except ModuleNotFoundError as exc:
         dependency_error(exc)
