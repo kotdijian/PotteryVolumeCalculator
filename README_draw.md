@@ -1,17 +1,171 @@
-# PotteryRadialSections v0.4.0
+# PotteryRadialSections v0.5.0
 
-土器3Dメッシュ（PLY / OBJ）から、**水平断面の楕円中心で回転軸を推定し、放射状の縦断面を抽出し、その内面プロファイルから容量を計算する**Python CLIプログラムです。
+土器3Dメッシュからの回転軸・縦断面・容量計算に加えて、v0.5.0では**2D実測図・断面図から `single` 法で容量を計算する Drawing-Single GUI**を追加しました。
 
-v0.4.0では容量計算を追加し、次の4方式を**個別または複数同時に選択**できます。
+このパッケージには2つの入口があります。
 
-1. `single`：指定した1つの縦断面を回転体化
-2. `optimized`：複数方向の縦断面をrobustに合成した最適回転体
-3. `angular`：軸対称を仮定せず、方向別半径を角度方向に積分
-4. `ellipse`：水平断面のinner ellipse面積をZ方向に積分する独立QA
-
-既定の `--volume-mode all` では4方式すべてを計算します。
+```text
+pottery_radial_sections.py   3D PLY/OBJ 用
+pottery_drawing_capacity.py  2D 図面用 GUI
+```
 
 ---
+
+# A. 2D図面からの Drawing-Single 容量計算
+
+## A-1. 対応入力
+
+優先する利用形態に合わせ、次をサポートします。
+
+- ラスタ画像: `PNG / JPEG / TIFF / BMP / WEBP`
+- `SVG`: Adobe Illustrator等から書き出したSVGを含む
+- `PDF`: 指定ページを画像化して利用
+
+SVG/PDFについても、v0.5.0ではベクトルpathを直接容量計算へ渡さず、**画面表示用にレンダリングした画像をdigitize**します。したがってSVG/PDFの内部単位やDPIを縮尺として信用せず、すべての形式でGUIによる実寸校正を行います。
+
+### 前提
+
+- 左右両側の**内面縁（inner profile）**が図化されている
+- 図面の水平・垂直がすでに定まっている
+- 回転軸は垂直である
+- 単純な1価関数 `r(z)` として扱える器形を初期対象とする
+
+図面線の完全自動認識はv0.5.0には入れていません。研究用の初版として、**縮尺・回転軸・左右内面を人が明示的に指定**し、その入力をCSV/JSONへ保存する方式を採用しています。
+
+## A-2. インストール
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+macOS/Windowsの標準的なPython.org配布版ではGUIにTkinterを利用できます。
+
+## A-3. 起動
+
+図面を起動時に指定する場合:
+
+```bash
+python3 pottery_drawing_capacity.py pottery_section.png
+```
+
+ファイル選択から開始する場合:
+
+```bash
+python3 pottery_drawing_capacity.py
+```
+
+PDFの場合は複数ページならGUIでページ番号を指定できます。コマンドから明示することもできます。
+
+```bash
+python3 pottery_drawing_capacity.py report.pdf --page 12
+```
+
+## A-4. GUIの操作順
+
+1. **図面を開く**
+2. **1 縮尺 (2点)** を押す
+3. スケールバーなど既知距離の両端を2点クリック
+4. その実寸を `mm` で入力
+5. **2 回転軸X** を押し、垂直な回転軸上を1点クリック
+   - 水平・垂直が既定なのでX座標のみ使用します
+6. **3 左内面** を押し、内腔底部から口縁へ順にクリック
+7. `Enter` または右クリックで左内面を確定
+8. **4 右内面** も同様に指定
+9. **計算・保存**
+
+`Ctrl+Z`または「1点戻す」で直前のdigitize点を戻せます。`+ / -`またはマウスホイールで拡大縮小できます。
+
+## A-5. 縮尺
+
+2点間の画像距離を `D_px`、ユーザー入力実寸を `D_mm` とすると、
+
+```text
+mm_per_pixel = D_mm / D_px
+```
+
+を採用します。図面・SVG・PDFの内部DPIや用紙サイズは容量計算の実寸には使いません。
+
+## A-6. Drawing-Single 容量計算
+
+回転軸から左右内面までの半径を
+
+```text
+r_left(z)
+r_right(z)
+```
+
+とし、3Dモードの `single` と同じ二側面定義で
+
+```text
+r_equivalent(z) = sqrt((r_left(z)^2 + r_right(z)^2) / 2)
+A(z) = pi/2 * (r_left(z)^2 + r_right(z)^2)
+```
+
+を用います。
+
+左右プロファイルの共通Z範囲を計算領域とし、上端は**左右のうち低い口縁高**、すなわちspill levelとします。プロファイルを既定 `0.5 mm` 間隔でZ方向に補間し、断面積を台形積分します。
+
+```bash
+--z-step-mm 0.5
+```
+
+結果には合成容量だけでなく、左側のみ・右側のみをそれぞれ回転した診断容量も保存します。
+
+## A-7. 出力
+
+既定では入力ファイルと同じ場所に、
+
+```text
+<入力名>_DrawingCapacity/
+```
+
+を作成します。
+
+```text
+source_render.png
+  GUIで実際にdigitizeした表示画像
+
+drawing_profile_raw.csv
+  左右のクリック点、画像座標、軸からの距離、Z座標
+
+drawing_profile_resampled.csv
+  容量計算に使用したZごとの左右半径・等価半径・断面積
+
+drawing_volume_summary.csv
+drawing_volume_summary.json
+  容量、左右個別容量、spill level等
+
+drawing_metadata.json
+  元ファイルSHA256、縮尺指定2点、mm/px、回転軸X、前提条件等
+
+drawing_qc_overlay.png
+  元図上に縮尺、回転軸、左右digitize線、spill levelを重ねた監査図
+
+drawing_profile_plot.png
+  左右内面を回転軸基準のr-z図として表示
+```
+
+SVG/PDFを入力した場合も、`source_render.png`を保存するため、どのレンダリング画像上で測定したかを後から確認できます。
+
+## A-8. SELF TEST
+
+半径50 mm、高さ100 mmの円筒を模擬した内部テスト:
+
+```bash
+python3 pottery_drawing_capacity.py --self-test
+```
+
+理論値は
+
+```text
+0.785398163 L
+```
+
+で、v0.5.0のテストでは数値誤差範囲で一致します。
+
+---
+
+# B. 3Dメッシュからの回転軸・縦断面・容量計算
 
 ## 1. 前提となる3Dモデル
 
@@ -69,7 +223,7 @@ PLYはtexture UVによる頂点再分割を避けるため、`fix_texture=False`
 
 外面しか利用できない資料について、後続の容量復元で単一器厚またはZ位置付き器厚プロファイルを入力して内面を推定する機能は、別段階として追加する想定です。
 
-v0.4.0の容量計算は、入力メッシュ中に実際の内面が存在する場合を対象とします。
+v0.5.0の容量計算は、入力メッシュ中に実際の内面が存在する場合を対象とします。
 
 ### 中心外れ値と最終軸
 
@@ -120,7 +274,7 @@ CSV、edge PLY、point-cloud PLYを保存します。PLYは**入力メッシュ�
 
 `--single-angle 0`は、0°/180°を通る**1枚の全縦断面平面**を選択します。
 
-1枚の全断面には軸の両側に2つの内面半径プロファイルがあります。v0.4.0では各高さで、
+1枚の全断面には軸の両側に2つの内面半径プロファイルがあります。v0.5.0では各高さで、
 
 ```text
 r_equivalent = sqrt((r_angle² + r_opposite²) / 2)
@@ -184,7 +338,7 @@ A(z) = 1/2 ∫ r(z,θ)² dθ
 
 30°間隔なら12方向を使います。
 
-この方式は、楕円化・円形化されない**器形の非対称性を容量へ直接反映**できるため、v0.4.0では主要な計算法の一つとして扱います。
+この方式は、楕円化・円形化されない**器形の非対称性を容量へ直接反映**できるため、v0.5.0では主要な計算法の一つとして扱います。
 
 一部方向の半径が欠ける高さでは、既定で75%以上の方向が有効な場合に限り、角度方向の周期的線形補間を行います。
 
@@ -439,7 +593,7 @@ python3 pottery_radial_sections.py pottery.ply \
 
 ---
 
-## 11. 0015Jinmen_small.plyでのv0.4.0検証
+## 11. 0015Jinmen_small.plyでのv0.5.0検証
 
 既定設定：
 

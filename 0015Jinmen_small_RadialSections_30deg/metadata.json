@@ -1,0 +1,99 @@
+{
+  "program": "PotteryRadialSections",
+  "version": "0.3.0",
+  "input": "0015Jinmen_small.ply",
+  "input_unit": "m",
+  "mesh_vertices": 350070,
+  "mesh_faces": 700000,
+  "axis_direction": [
+    0.0,
+    0.0,
+    1.0
+  ],
+  "axis_center_xy_native": [
+    0.1380923722372103,
+    -0.10749140595798058
+  ],
+  "axis_center_xy_mm": [
+    138.0923722372103,
+    -107.49140595798058
+  ],
+  "axis_method": "horizontal-section robust ellipse centers + MAD center-outlier rejection + inlier arithmetic mean",
+  "axis_surface_mode": "inner",
+  "axis_center_source": "inner",
+  "axis_summary": {
+    "axis_surface_mode": "inner",
+    "axis_center_source": "inner",
+    "attempted_sections": 20,
+    "valid_source_sections": 19,
+    "used_for_axis": 19,
+    "excluded_center_outliers": 0,
+    "axis_center_x_mm": 138.0923722372103,
+    "axis_center_y_mm": -107.49140595798058,
+    "center_outlier_mad_k": 3.0,
+    "center_outlier_threshold_mm": 5.56862206728877,
+    "sd_x_mm": 1.1456680054741286,
+    "sd_y_mm": 2.0971314390212727,
+    "mad_x_mm": 0.6046767502313344,
+    "mad_y_mm": 0.8913318880518375,
+    "mean_radial_offset_mm": 2.0401954726286275,
+    "median_radial_offset_mm": 1.924603857386879,
+    "rms_radial_offset_mm": 2.325932502566082,
+    "p95_radial_offset_mm": 4.114094136220377,
+    "max_radial_offset_mm": 4.2061884517113235,
+    "axis_drift_x_mm_per_100mm": 1.1305478571156469,
+    "axis_drift_y_mm_per_100mm": -1.9059706190092733,
+    "estimated_centerline_tilt_deg": 1.2694933810287867,
+    "tilt_is_diagnostic_only": true,
+    "tilt_is_not_auto_corrected": true,
+    "mean_outer_inner_center_offset_mm": 0.7550824220213158,
+    "median_outer_inner_center_offset_mm": 0.4357763639477038,
+    "mean_selected_fit_rmse_mm": 0.9493518057865276,
+    "median_selected_fit_rmse_mm": 0.7455687415226213,
+    "wall_thickness_used_for_axis": false,
+    "wall_thickness_supported_later_for_volume_reconstruction": false,
+    "z_sampling": {
+      "mode": "relative_equal_divisions",
+      "z_sections": 20,
+      "count": 20,
+      "height_mm": 283.7930079549551
+    }
+  },
+  "z_sampling": {
+    "mode": "relative_equal_divisions",
+    "z_sections": 20,
+    "count": 20,
+    "height_mm": 283.7930079549551
+  },
+  "angle_step_deg": 30.0,
+  "start_angle_deg": 0.0,
+  "full_section_plane_angles_deg": [
+    0.0,
+    30.0,
+    60.0,
+    90.0,
+    120.0,
+    150.0
+  ],
+  "radial_half_section_angles_deg": [
+    0.0,
+    30.0,
+    60.0,
+    90.0,
+    120.0,
+    150.0,
+    180.0,
+    210.0,
+    240.0,
+    270.0,
+    300.0,
+    330.0
+  ],
+  "sample_spacing_mm": 0.5,
+  "contour_resample_spacing_mm": 0.5,
+  "section_ply_coordinate_system": "same XYZ coordinate system and unit as input mesh",
+  "wall_thickness_used_for_axis": false,
+  "outer_mode_note": "If axis_surface=outer, wall thickness is intentionally not used here; single or Z-positioned thickness measurements can be used later for inner-profile reconstruction and volume calculation.",
+  "tilt_note": "Center drift versus Z is diagnostic only; the model is not auto-rotated or tilt-corrected in v0.3.0.",
+  "volume_reconstruction_implemented": false
+}
