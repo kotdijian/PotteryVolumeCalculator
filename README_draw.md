@@ -9,6 +9,8 @@ pottery_radial_sections.py   3D PLY/OBJ 用
 pottery_drawing_capacity.py  2D 図面用 GUI
 ```
 
+**Pythonやコンソール、Powershellなどの使用方法について[README](/README.md)をご参照ください**
+
 ---
 
 # A. 2D図面からの Drawing-Single 容量計算
