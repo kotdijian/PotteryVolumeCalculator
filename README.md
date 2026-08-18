@@ -2,8 +2,12 @@
 
 PLY / OBJ形式の土器3Dメッシュから、**液体が最初に外へ溢れ出す直前までの最大内容量**をvoxel法で推定する実験用ツールです。
 
+A set of experimental Python tools for estimating pottery vessel capacity from either 3D meshes or 2D archaeological drawings.
+
 **README in English is [here](/README_EN.md)**
+
 **3Dデータの縦断面による容積計算は[こちら](/README_profile.md)**
+
 **「実測図」断面からの容積計算は[こちら](/README_draw.md)**
 
 v1.3では、用途に応じて次の2モードを並列実装しました。
