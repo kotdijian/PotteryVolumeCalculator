@@ -1,18 +1,8 @@
-# PotteryVolumeCalculator v1.3.1
+# PotteryVolumeCalculator v1.3.2
 
 PLY / OBJ形式の土器3Dメッシュから、**液体が最初に外へ溢れ出す直前までの最大内容量**をvoxel法で推定する実験用ツールです。
 
-A set of experimental Python tools for estimating pottery vessel capacity from either 3D meshes or 2D archaeological drawings.
-
-**README in English is [here](/README_EN.md)**
-
-**3Dデータの縦断面による容積計算は[こちら](/README_profile.md)**
-
-**「実測図」断面からの容積計算は[こちら](/README_draw.md)**
-
-v1.3では、用途に応じて次の2モードを並列実装しました。
-
-> **v1.3.1の変更点**：テクスチャUV seamを考古学的な接合境界と誤認する可能性が確認されたため、`archaeological/raw_*`の出力と、raw boundaryを用いたspill近接診断を一時的に停止しました。容量計算アルゴリズム自体はv1.3.0から変更していません。接合境界抽出は別アルゴリズムとして再設計します。
+v1.3では、用途に応じて次の2モードを並列実装しています。v1.3.2では、voxelization前のscale / resource preflightを追加しました。
 
 ## このプログラムに適した3Dモデル
 
@@ -46,6 +36,7 @@ PotteryVolumeCalculatorは、土器3Dモデルの形状から、**液体を保�
 - **人面墨書土器（奈良時代）**
 - 静岡県磐田市御殿・二之宮遺跡出土
 - 磐田市埋蔵文化財センター所蔵
+- レガシズ3D掲載名：**人面墨書土器2**
 - レガシズ3Dよりダウンロード  
   https://lega-shizu.com/legashizu3d/archives/data/117
 - レガシズ3D上のモデル識別情報：LS0015
@@ -255,7 +246,7 @@ python3 vessel_voxel_volume.py --version
 次のように表示されれば起動できます。
 
 ```text
-vessel_voxel_volume.py 1.3.1
+vessel_voxel_volume.py 1.3.0
 ```
 
 環境の詳細を確認する場合：
@@ -917,8 +908,11 @@ validation_summary.csv
 │   ├── pymeshlab_crosscheck.json
 │   └── preprocessing_summary.json
 ├── pitch_2mm/
+│   └── qa/preflight_scale_resource.json
 ├── pitch_1mm/
+│   └── qa/preflight_scale_resource.json
 └── pitch_0p5mm/
+    └── qa/preflight_scale_resource.json
 ```
 
 validationモードではさらに、
@@ -932,33 +926,15 @@ validation_summary.json
 
 ---
 
-# 14. 接合境界関連データの暫定的な扱い
+# 14. `archaeological/raw_*`について
 
-### `archaeological/raw_*`はv1.3.1では出力しません
+v1.3.1以降では、**pre-weldの`archaeological/raw_*`は生成しません**。
 
-検証の結果、faceごとのUV座標を持つPLYでは、Trimeshの既定読込により同一位置のvertexがUV seamに沿って再分割される場合があることが確認されました。そのため、pre-weld状態で検出されるboundary edgeをそのまま実際の土器破片の接合境界とみなすことはできません。
+検証用PLYでは、face-corner UVの不連続をTrimeshが処理すると、元の幾何学的境界ではないtexture seamがboundary edgeとして現れることが確認されました。これを接合境界と誤認しないため、raw boundary / raw component / raw-spill近接診断の出力を停止しています。
 
-この誤認を避けるため、v1.3.1では以下を一時停止しています。
+`archaeological/`に残すのはexact-coordinate weld後のtopology QA用情報だけです。これらも実破片を自動同定した結果ではありません。
 
-- `archaeological/raw_boundary_*`
-- `archaeological/raw_components.*`
-- `boundary_before_after_comparison.json`
-- `spill_vs_raw_fragment_boundaries.ply`
-- `spill_boundary_proximity.json`
-
-これらは**容量計算には使用しません**。したがって、停止によって最大保持容量の計算方法は変わりません。
-
-`archaeological/`には当面、exact-coordinate weld後のQA用データだけを保存します。
-
-```text
-archaeological/
-├── after_exact_weld_boundary_stats.json
-├── after_exact_weld_components.csv
-├── after_exact_weld_components.json
-└── after_exact_weld_components_colored.ply
-```
-
-これらも現段階では**実破片の境界・破片そのものを自動同定した結果ではありません**。接合境界の抽出は、元PLY topology、face-corner UV、形状の曲率・dihedral angle、表面色などを別々の特徴量として扱う方法を検討します。
+接合境界抽出は、容量計算とは独立した`PotteryFragmentBoundaryExtractor`として別途検討します。
 
 ---
 
@@ -1013,7 +989,7 @@ python3 vessel_voxel_volume.py --version
 ```
 
 ```text
-vessel_voxel_volume.py 1.3.1
+vessel_voxel_volume.py 1.3.0
 ```
 
 を確認してください。
@@ -1084,11 +1060,9 @@ python3 vessel_voxel_volume.py pottery.ply \
 
 ---
 
-# 20. 計算量
+# 20. 計算量とpreflight safety check
 
 voxel pitchを半分にすると、3次元gridのセル数は概ね8倍になります。
-
-したがって、
 
 ```text
 2 mm → 高速
@@ -1097,6 +1071,51 @@ voxel pitchを半分にすると、3次元gridのセル数は概ね8倍になり
 ```
 
 という使い分けを推奨します。
+
+## 20.1 単位・計算量の事前検査
+
+v1.3.2では、実際の`mesh.voxelized()`を開始する前に、指定された`--unit`でmmへ換算した外形寸法と`--pitch`から、dense voxel gridを事前推定します。
+
+表示例：
+
+```text
+=== Preflight scale / voxel resource check ===
+extents mm      : X=231.424, Y=229.222, Z=283.793
+pitch           : 0.5 mm
+estimated grid  : 472 x 468 x 577
+estimated cells : 127,456,992
+working memory  : ~972.42 MiB (preflight indicator)
+```
+
+`working memory`は厳密なpeak RAMではなく、複数のboolean arrayを用いる処理を想定した安全側の指標です。Trimesh / SciPyが追加配列を確保するため、実際のpeak RAMはこれを上回る場合があります。
+
+### soft warning
+
+次の場合は処理を継続しますがWARNINGを表示します。
+
+- 指定単位で最大寸法が20 mm未満
+- 指定単位で最大寸法が3,000 mm超
+- 推定dense gridが200,000,000 cells以上
+
+これは単位指定ミスや、非常に重い処理条件を早期に気づくための警告です。
+
+### hard stop
+
+次のいずれかに該当すると、**surface voxelizationを開始せずエラー終了**します。
+
+- 最大寸法がpitchの4 voxel未満で、極端に低解像度
+- 推定gridの1軸が50,000 cells超
+- 推定grid総数が500,000,000 cells超
+
+典型的には、実データがmmなのに`--unit m`と指定するとgridが爆発するためhard stopします。逆に、実データがmなのに`--unit mm`と指定した場合も、極端な低解像度としてhard stopします。
+
+事前診断は各pitchの、
+
+```text
+pitch_Xmm/qa/preflight_scale_resource.json
+```
+
+にも保存されます。
 
 ---
 
@@ -1110,21 +1129,15 @@ SELF_TEST.md
 
 を参照してください。
 
-v1.3.1では、
+v1.3.2では、従来の計算系テストに加えて、
 
-- 構文チェック
-- `--help`
-- `--diagnose-env`
-- `--pitch`単一実行
-- `--validate` 2/1/0.5 mm完走
-- validation CSV/JSON生成
-- pitch間差分計算
-- 経験的収束診断
-- `--pitch`と`--validate`の同時指定拒否
-- m入力での単位保持
-- `archaeological/raw_*`が生成されないこと
+- 正常な100 mm synthetic vesselがpreflightを通過して容量計算まで完走
+- mm座標を誤って`--unit m`とした場合、推定gridが約10^15 cellsとなりvoxelization前にhard stop
+- m座標を誤って`--unit mm`とした場合、pitchに対して極端な低解像度としてhard stop
+- 正しい`0015Jinmen_small.ply`相当寸法では2 / 1 / 0.5 mmがpreflightを通過
+- `archaeological/raw_*`が生成されない
 
-を確認しています。
+ことを確認しています。詳細は`SELF_TEST.md`を参照してください。
 
 ---
 

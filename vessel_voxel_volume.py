@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PotteryVolumeCalculator
-Version 1.3.1
+Version 1.3.2
 
 OBJ / PLY の土器メッシュから、内面を明示的に抽出せず、
 「液体が最初に外へ溢れ出す直前までの最大内容量」を voxel 法で推定する。
@@ -17,9 +17,8 @@ v1 の主要方針
 6. spill直前までの空隙を最大保持液量として計算
 7. 出力PLYの座標単位は入力モデルと同じ単位へ戻す
 8. 出力ファイルは専用フォルダ内へ整理
-9. archaeological/raw_* は v1.3.1 では出力しない
-   （texture UV seam と考古学的接合境界を区別できないため一時停止）
-10. exact-coordinate weld 後の topology / boundary は QA 用に保存
+9. pre-weld raw boundary派生出力は停止（texture UV seam誤認防止）
+10. voxelization前にscale / resource preflightを実施
 
 対象（v1）
 ----------
@@ -53,7 +52,7 @@ from contextlib import redirect_stdout
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 
 # ----------------------------------------------------------------------
@@ -119,6 +118,167 @@ VOLUME_UNIT_BY_INPUT = {
     "cm": "cm^3",
     "m": "m^3",
 }
+
+# Preflight safeguards. These are intentionally conservative and run before
+# Trimesh surface voxelization allocates the dense voxel matrix.
+PREFLIGHT_WARN_GRID_CELLS = 200_000_000
+PREFLIGHT_HARD_STOP_GRID_CELLS = 500_000_000
+PREFLIGHT_HARD_STOP_AXIS_CELLS = 50_000
+PREFLIGHT_ESTIMATED_WORKING_BYTES_PER_CELL = 8
+PREFLIGHT_WARN_MIN_MAX_EXTENT_MM = 20.0
+PREFLIGHT_WARN_MAX_MAX_EXTENT_MM = 3000.0
+PREFLIGHT_MIN_LONG_AXIS_VOXELS = 4.0
+
+
+def human_bytes(n_bytes: float) -> str:
+    value = float(n_bytes)
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    for unit_name in units:
+        if abs(value) < 1024.0 or unit_name == units[-1]:
+            return f"{value:.2f} {unit_name}"
+        value /= 1024.0
+    return f"{value:.2f} PiB"
+
+
+def estimate_padded_voxel_grid(extents_mm, pitch_mm: float, pad: int):
+    """Conservative bbox-based dense-grid estimate used only for preflight."""
+    extents_mm = np.asarray(extents_mm, dtype=np.float64)
+    if extents_mm.shape != (3,) or not np.isfinite(extents_mm).all():
+        raise ValueError("preflight: mesh extents are invalid")
+    if np.any(extents_mm <= 0):
+        raise ValueError("preflight: mesh extents must be positive")
+    if pitch_mm <= 0:
+        raise ValueError("preflight: pitch must be positive")
+    if pad < 0:
+        raise ValueError("preflight: pad must be >= 0")
+
+    core = np.ceil(extents_mm / float(pitch_mm)).astype(object) + 1
+    padded = tuple(int(v) + 2 * int(pad) for v in core)
+    cells = math.prod(padded)
+    return padded, int(cells)
+
+
+def preflight_scale_and_voxel_check(
+    extents_mm,
+    unit: str,
+    pitch_mm: float,
+    pad: int,
+):
+    """
+    Detect likely unit mistakes and reject unsafe dense voxel grids before
+    mesh.voxelized() starts.
+
+    Physical-size checks are soft warnings. Resource/under-resolution checks
+    are hard stops because continuing is either unsafe or not meaningful.
+    """
+    extents_mm = np.asarray(extents_mm, dtype=np.float64)
+    grid_shape, grid_cells = estimate_padded_voxel_grid(
+        extents_mm, pitch_mm, pad
+    )
+    max_extent = float(extents_mm.max())
+    min_extent = float(extents_mm.min())
+    long_axis_voxels = max_extent / float(pitch_mm)
+    estimated_working_bytes = (
+        grid_cells * PREFLIGHT_ESTIMATED_WORKING_BYTES_PER_CELL
+    )
+
+    warnings = []
+    hard_reasons = []
+
+    if max_extent < PREFLIGHT_WARN_MIN_MAX_EXTENT_MM:
+        warnings.append(
+            "指定された単位ではモデル最大寸法が20 mm未満です。"
+            "入力データの実単位と --unit を確認してください。"
+        )
+    elif max_extent > PREFLIGHT_WARN_MAX_MAX_EXTENT_MM:
+        warnings.append(
+            "指定された単位ではモデル最大寸法が3,000 mmを超えます。"
+            "大型資料でない場合は --unit の指定ミスを疑ってください。"
+        )
+
+    if grid_cells >= PREFLIGHT_WARN_GRID_CELLS:
+        warnings.append(
+            f"推定dense voxel gridが大きいです ({grid_cells:,} cells)。"
+            "処理時間とメモリ使用量が大きくなる可能性があります。"
+        )
+
+    if long_axis_voxels < PREFLIGHT_MIN_LONG_AXIS_VOXELS:
+        hard_reasons.append(
+            f"最大寸法がpitchの{long_axis_voxels:.2f}倍しかなく、"
+            "voxel計算として極端に低解像度です。"
+        )
+
+    if max(grid_shape) > PREFLIGHT_HARD_STOP_AXIS_CELLS:
+        hard_reasons.append(
+            f"推定grid axisが上限 {PREFLIGHT_HARD_STOP_AXIS_CELLS:,} cellsを"
+            f"超えます (max={max(grid_shape):,})。"
+        )
+
+    if grid_cells > PREFLIGHT_HARD_STOP_GRID_CELLS:
+        hard_reasons.append(
+            f"推定grid総cell数が安全上限 {PREFLIGHT_HARD_STOP_GRID_CELLS:,}を"
+            f"超えます ({grid_cells:,})。"
+        )
+
+    report = {
+        "status": "hard_stop" if hard_reasons else (
+            "warning" if warnings else "ok"
+        ),
+        "input_unit": unit,
+        "pitch_mm": float(pitch_mm),
+        "pad_cells": int(pad),
+        "extents_mm": [float(v) for v in extents_mm],
+        "max_extent_mm": max_extent,
+        "min_extent_mm": min_extent,
+        "long_axis_voxels": float(long_axis_voxels),
+        "estimated_padded_grid_shape": [int(v) for v in grid_shape],
+        "estimated_grid_cells": int(grid_cells),
+        "estimated_working_bytes_per_cell": (
+            PREFLIGHT_ESTIMATED_WORKING_BYTES_PER_CELL
+        ),
+        "estimated_working_memory_bytes": int(estimated_working_bytes),
+        "estimated_working_memory_human": human_bytes(estimated_working_bytes),
+        "warning_grid_cells": PREFLIGHT_WARN_GRID_CELLS,
+        "hard_stop_grid_cells": PREFLIGHT_HARD_STOP_GRID_CELLS,
+        "hard_stop_axis_cells": PREFLIGHT_HARD_STOP_AXIS_CELLS,
+        "warnings": warnings,
+        "hard_stop_reasons": hard_reasons,
+        "note": (
+            "The memory figure is a conservative working-set indicator, not an "
+            "exact peak-RAM prediction. Trimesh/SciPy may allocate additional arrays."
+        ),
+    }
+    return report
+
+
+def print_preflight_report(report):
+    print("\n=== Preflight scale / voxel resource check ===")
+    ex = report["extents_mm"]
+    gs = report["estimated_padded_grid_shape"]
+    print(
+        "extents mm      : "
+        f"X={ex[0]:.3f}, Y={ex[1]:.3f}, Z={ex[2]:.3f}"
+    )
+    print(f"pitch           : {report['pitch_mm']:.6g} mm")
+    print(f"estimated grid  : {gs[0]:,} x {gs[1]:,} x {gs[2]:,}")
+    print(f"estimated cells : {report['estimated_grid_cells']:,}")
+    print(
+        "working memory  : ~"
+        f"{report['estimated_working_memory_human']} "
+        "(preflight indicator)"
+    )
+
+    sys.stdout.flush()
+    for message in report["warnings"]:
+        print(f"WARNING: {message}", file=sys.stderr)
+
+    if report["hard_stop_reasons"]:
+        details = "\n".join(f"- {x}" for x in report["hard_stop_reasons"])
+        raise RuntimeError(
+            "PRE-FLIGHT HARD STOP: voxelizationを開始しません。\n"
+            f"{details}\n"
+            "入力モデルの実単位、--unit、--pitch を確認してください。"
+        )
 
 
 def jsonable(value):
@@ -970,18 +1130,16 @@ def stage_a_preprocess(
     require_pymeshlab: bool = False,
 ):
     """
-    Reference preprocessing (v1.3.1 interim boundary-output policy):
+    Reference preprocessing:
       1. Trimesh file I/O, process=False
       2. Deterministic loader-state topology QA
       3. NumPy exact-coordinate weld + unreferenced removal
       4. Deterministic post-weld topology QA
-      5. Export post-weld boundary/component products for QA only
+      5. Export post-weld topology derivatives only
       6. Optional PyMeshLab cross-check ONLY
 
-    IMPORTANT:
-    archaeological/raw_* products are intentionally disabled in v1.3.1.
-    The current PLY loader may re-index texture UV seams, so pre-weld
-    boundary edges cannot safely be interpreted as archaeological sherd joins.
+    v1.3.1+ deliberately does NOT export pre-weld archaeological/raw_*
+    because texture-UV reindexing can create artificial seam boundaries.
     """
     vertices_before, faces_before = load_mesh_arrays_with_trimesh(input_path)
 
@@ -1009,6 +1167,7 @@ def stage_a_preprocess(
         sample_spacing_mm=boundary_sample_mm,
     )
 
+
     cleaned_path = processed_dir / f"{input_path.stem}_exact_welded.ply"
     trimesh.Trimesh(
         vertices=vertices_after,
@@ -1030,23 +1189,12 @@ def stage_a_preprocess(
 
     report = {
         "reference_engine": "NumPy + Trimesh",
-        "raw_archaeological_derivatives": {
-            "enabled": False,
-            "reason": (
-                "Disabled in v1.3.1 because texture-UV reindexing can create "
-                "pre-weld boundary seams that are not archaeological join boundaries."
-            ),
-        },
         "before": {
             "counts": {
                 "vertices": int(len(vertices_before)),
                 "faces": int(len(faces_before)),
             },
             "summary": topology_before,
-            "note": (
-                "Pre-weld topology is retained as a loader-state diagnostic only; "
-                "it is not exported as archaeological/raw_* data."
-            ),
         },
         "after": {
             "counts": {
@@ -1065,14 +1213,15 @@ def stage_a_preprocess(
         "input_reader": "trimesh",
         "processed_mesh_writer": "trimesh",
         "pymeshlab_crosscheck": pml_report,
+        "pre_weld_raw_boundary_derivatives_exported": False,
         "after_exact_weld_boundary": cleaned_boundary_stats,
     }
     write_json(qa_dir / "preprocessing_summary.json", report)
 
     archaeological = {
-        "raw_derivatives_enabled": False,
         "cleaned_boundary_stats": cleaned_boundary_stats,
         "cleaned_boundary_samples_native": cleaned_boundary_samples,
+        "raw_boundary_derivatives_exported": False,
     }
 
     return vertices_after, faces_after, report, archaeological
@@ -1814,12 +1963,12 @@ def estimate_volume(
     print(f"plugins loaded    : {pml_env.get('plugins_loaded')}")
     print(f"cross-check status: {pml_cross.get('status')}")
     print("used for calculation mesh: False")
-    print("archaeological/raw_*  : disabled (v1.3.1 interim policy)")
+    print("pre-weld raw boundary derivatives: disabled")
     print(
-        f"after exact-weld boundary edges: "
+        f"after exact-weld boundary edges : "
         f"{archaeological['cleaned_boundary_stats']['boundary_edges']:,}"
     )
-    print(f"archaeological QA output: {layout['archaeological']}")
+    print(f"post-weld QA output : {layout['archaeological']}")
 
     # ---- Internal Trimesh in mm ----
     vertices_mm = vertices_native * scale_to_mm
@@ -1844,6 +1993,15 @@ def estimate_volume(
         f"Y={native_length(extents_mm[1], unit):.6g}, "
         f"Z={native_length(extents_mm[2], unit):.6g} {unit}"
     )
+
+    preflight_report = preflight_scale_and_voxel_check(
+        extents_mm=extents_mm,
+        unit=unit,
+        pitch_mm=pitch,
+        pad=pad,
+    )
+    write_json(layout["run_qa"] / "preflight_scale_resource.json", preflight_report)
+    print_preflight_report(preflight_report)
 
     # ---- Stage B: Trimesh QA ----
     print("\n=== Stage B: Trimesh QA ===")
@@ -1935,6 +2093,7 @@ def estimate_volume(
             "input": str(input_path),
             "input_unit": unit,
             "pitch_mm": pitch,
+            "preflight_scale_resource": preflight_report,
             "output_directory": str(layout["base"]),
             "preprocessing_qa": pml_report,
             "trimesh_qa": tm_report,
@@ -2015,10 +2174,11 @@ def estimate_volume(
             "input": str(input_path),
             "input_unit": unit,
             "pitch_mm": pitch,
+            "preflight_scale_resource": preflight_report,
             "output_directory": str(layout["base"]),
             "preprocessing_qa": pml_report,
-            "archaeological_boundary_derivatives": {
-                "raw_enabled": False,
+            "topology_derivatives": {
+                "pre_weld_raw_boundary_derivatives_exported": False,
                 "after_exact_weld": archaeological["cleaned_boundary_stats"],
             },
             "trimesh_qa": tm_report,
@@ -2140,10 +2300,8 @@ def estimate_volume(
         print(f"spill slab wall: {slab_surface_path}")
         print(f"spill slab free: {slab_free_path}")
 
-        # v1.3.1: raw-boundary proximity/overlap outputs are disabled.
-        # Pre-weld texture UV seams cannot yet be separated reliably from
-        # archaeological join boundaries.
-        voxel_qa["raw_boundary_spill_comparison_enabled"] = False
+        # Pre-weld raw-boundary/spill comparison is intentionally disabled.
+        # Texture-UV seam reindexing can create artificial boundary candidates.
 
     voxel_qa.update({
         "safe_level_z_mm": safe_z_mm,
@@ -2172,6 +2330,7 @@ def estimate_volume(
         "internal_coordinate_unit": "mm",
         "scale_to_mm": scale_to_mm,
         "pitch_mm": pitch,
+        "preflight_scale_resource": preflight_report,
         "output_directory": str(layout["base"]),
         "run_directory": str(layout["run"]),
         "mesh_extents_native": [
@@ -2179,8 +2338,8 @@ def estimate_volume(
         ],
         "mesh_extents_native_unit": unit,
         "preprocessing_qa": pml_report,
-        "archaeological_boundary_derivatives": {
-            "raw_enabled": False,
+        "topology_derivatives": {
+            "pre_weld_raw_boundary_derivatives_exported": False,
             "after_exact_weld": archaeological["cleaned_boundary_stats"],
         },
         "trimesh_qa": tm_report,
@@ -2667,14 +2826,14 @@ def main():
         "--seed-persist",
         type=int,
         default=3,
-        help="互換性のため保持。v1.3.0のvalidated seed方式では使用しません。",
+        help="互換性のため保持。v1.3.2のvalidated seed方式では使用しません。",
     )
     parser.add_argument(
         "--close-iters",
         type=int,
         default=1,
         help=(
-            "互換性のため保持。v1.3.0のvalidated seed方式では"
+            "互換性のため保持。v1.3.2のvalidated seed方式では"
             "morphological closingを使用しません。"
         ),
     )
@@ -2683,8 +2842,8 @@ def main():
         type=float,
         default=0.5,
         help=(
-            "after-exact-weld boundaryをQA用に線として保存する際のサンプリング間隔 [mm]。"
-            "v1.3.1ではarchaeological/raw_*は出力しない。容量計算には影響しない"
+            "exact-weld後boundaryをQA用に保存する際のサンプリング間隔 [mm]。"
+            "既定値 0.5。容量計算には影響しない"
         ),
     )
     parser.add_argument(
