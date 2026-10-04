@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PotteryRadialSections
-Version 0.3.0
+Version 0.4.0
 
 Estimate a pottery rotation axis from a series of horizontal XY sections,
 then extract longitudinal sections through that estimated Z-parallel axis.
@@ -16,14 +16,18 @@ Default workflow:
 7. Remove 2-D center outliers using a MAD rule.
 8. Average retained centers to define the final XY position of the Z-parallel axis.
 9. Extract 30-degree longitudinal sections through the final axis.
-10. Export CSV/PLY/PNG QC products.
+10. Optionally estimate capacity using one or more selectable methods:
+    single selected radial profile, optimized axisymmetric model,
+    angular integration without axial-symmetry assumption, and horizontal ellipses.
+11. Export CSV/JSON/PLY/PNG QC products.
 
 Important:
 - +Z is assumed to be the vessel vertical direction.
 - Axis fitting estimates only the XY axis position; it does NOT rotate/tilt the model.
 - A center-drift/tilt diagnostic is reported but not automatically corrected.
 - In outer mode, wall thickness is NOT used for axis estimation. It can be supplied
-  later during inner-profile reconstruction and volume calculation.
+  in a later wall-thickness reconstruction stage; v0.4.0 capacity methods require
+  an inner surface to be present in the input mesh.
 """
 from __future__ import annotations
 
@@ -37,7 +41,7 @@ import numpy as np
 import trimesh
 from scipy.optimize import least_squares
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 UNIT_SCALE_TO_MM = {"mm": 1.0, "cm": 10.0, "m": 1000.0}
 
@@ -574,6 +578,532 @@ def write_segment_csv(path: Path, segments: np.ndarray, center_xy_native: tuple[
                             f"{(p[2]-z_min_native)*scale_to_mm:.12g}"])
 
 
+
+# ----------------------------------------------------------------------
+# Capacity calculation helpers (v0.4)
+# ----------------------------------------------------------------------
+
+def _dedupe_sorted(values: np.ndarray, tolerance: float) -> np.ndarray:
+    v = np.sort(np.asarray(values, dtype=np.float64))
+    if len(v) <= 1:
+        return v
+    out = [float(v[0])]
+    for x in v[1:]:
+        if float(x) - out[-1] > tolerance:
+            out.append(float(x))
+        else:
+            # Multiple mesh-plane segments can meet at one geometric point.
+            # Keep a stable representative rather than counting the vertex twice.
+            out[-1] = 0.5 * (out[-1] + float(x))
+    return np.asarray(out, dtype=np.float64)
+
+
+def _fill_short_nan_gaps(values: np.ndarray, max_gap: int = 2) -> np.ndarray:
+    a = np.asarray(values, dtype=np.float64).copy()
+    good = np.isfinite(a)
+    n = len(a)
+    i = 0
+    while i < n:
+        if good[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not good[j]:
+            j += 1
+        gap = j - i
+        if i > 0 and j < n and gap <= max_gap and good[i-1] and good[j]:
+            a[i:j] = np.linspace(a[i-1], a[j], gap + 2)[1:-1]
+            good[i:j] = True
+        i = j
+    return a
+
+
+def _longest_finite_run(values: np.ndarray) -> tuple[int | None, int | None]:
+    good = np.isfinite(np.asarray(values, dtype=np.float64))
+    best = (None, None)
+    best_len = 0
+    i = 0
+    while i < len(good):
+        if not good[i]:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(good) and good[j]:
+            j += 1
+        if j - i > best_len:
+            best = (i, j)
+            best_len = j - i
+        i = j
+    return best
+
+
+def extract_ray_inner_profile(
+    full_segments: np.ndarray,
+    center_xy_native: tuple[float, float],
+    ray_angle_deg: float,
+    z_centers_native: np.ndarray,
+    z_step_mm: float,
+    scale_to_mm: float,
+    dedupe_tolerance_mm: float = 0.05,
+    max_gap_cells: int = 2,
+) -> dict:
+    """
+    Sample a longitudinal mesh-plane intersection at regular Z positions.
+
+    On a positive radial ray, a normal vessel-wall section has two crossings
+    while the ray begins inside the cavity: the smaller positive radius is the
+    inner surface and the larger is the outer surface. Below the inner bottom,
+    normally only the outer crossing exists, so no inner radius is assigned.
+
+    The longest continuous run of valid inner radii is retained. This rejects
+    isolated intersections caused by local geometry or numerical degeneracy.
+    """
+    zc = np.asarray(z_centers_native, dtype=np.float64)
+    inner = np.full(len(zc), np.nan, dtype=np.float64)
+    outer = np.full(len(zc), np.nan, dtype=np.float64)
+    counts = np.zeros(len(zc), dtype=np.int32)
+    if len(full_segments) == 0:
+        return {
+            "angle_deg": float(ray_angle_deg), "z_native": zc,
+            "z_mm": zc * scale_to_mm, "inner_radius_mm": inner,
+            "outer_radius_mm": outer, "positive_intersections": counts,
+            "run_start_index": None, "run_end_index": None,
+            "bottom_z_mm": None, "rim_z_mm": None, "valid_cells": 0,
+        }
+
+    seg = np.asarray(full_segments, dtype=np.float64)
+    z0, z1 = seg[:, 0, 2], seg[:, 1, 2]
+    rr = signed_r(seg, center_xy_native, ray_angle_deg)
+    r0, r1 = rr[:, 0], rr[:, 1]
+    dz = z1 - z0
+    eps_z = max(1e-12, (z_step_mm / scale_to_mm) * 1e-8)
+    tol_native = dedupe_tolerance_mm / scale_to_mm
+
+    for k, z in enumerate(zc):
+        nonhorizontal = np.abs(dz) > eps_z
+        lo = np.minimum(z0, z1) - eps_z
+        hi = np.maximum(z0, z1) + eps_z
+        mask = nonhorizontal & (z >= lo) & (z <= hi)
+        if not np.any(mask):
+            continue
+        t = (z - z0[mask]) / dz[mask]
+        ok = (t >= -1e-9) & (t <= 1.0 + 1e-9)
+        if not np.any(ok):
+            continue
+        rad = r0[mask][ok] + t[ok] * (r1[mask][ok] - r0[mask][ok])
+        rad = rad[rad >= -tol_native]
+        if len(rad) == 0:
+            continue
+        rad = np.maximum(rad, 0.0)
+        rad = _dedupe_sorted(rad, tol_native)
+        counts[k] = len(rad)
+        # Two or more positive crossings indicate cavity -> inner wall -> body -> outer wall.
+        if len(rad) >= 2:
+            inner[k] = float(rad[0] * scale_to_mm)
+            outer[k] = float(rad[-1] * scale_to_mm)
+
+    inner = _fill_short_nan_gaps(inner, max_gap=max_gap_cells)
+    outer = _fill_short_nan_gaps(outer, max_gap=max_gap_cells)
+    i0, i1 = _longest_finite_run(inner)
+    if i0 is None:
+        inner[:] = np.nan
+        outer[:] = np.nan
+        bottom = rim = None
+        valid_cells = 0
+    else:
+        keep = np.zeros(len(inner), dtype=bool)
+        keep[i0:i1] = True
+        inner[~keep] = np.nan
+        outer[~keep] = np.nan
+        z_mm = zc * scale_to_mm
+        bottom = float(z_mm[i0] - 0.5 * z_step_mm)
+        rim = float(z_mm[i1 - 1] + 0.5 * z_step_mm)
+        valid_cells = int(i1 - i0)
+
+    return {
+        "angle_deg": float(ray_angle_deg),
+        "z_native": zc,
+        "z_mm": zc * scale_to_mm,
+        "inner_radius_mm": inner,
+        "outer_radius_mm": outer,
+        "positive_intersections": counts,
+        "run_start_index": None if i0 is None else int(i0),
+        "run_end_index": None if i1 is None else int(i1),
+        "bottom_z_mm": bottom,
+        "rim_z_mm": rim,
+        "valid_cells": valid_cells,
+    }
+
+
+def robust_radius(values: np.ndarray, mad_k: float = 3.0) -> tuple[float, int, int]:
+    v = np.asarray(values, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    if len(v) == 0:
+        return float("nan"), 0, 0
+    if len(v) <= 2:
+        return float(np.mean(v)), len(v), len(v)
+    med = float(np.median(v))
+    mad = float(np.median(np.abs(v - med)))
+    sigma = 1.4826 * mad
+    if sigma <= 1e-12:
+        use = np.ones(len(v), dtype=bool)
+    else:
+        use = np.abs(v - med) <= mad_k * sigma
+        if np.count_nonzero(use) < max(2, len(v) // 2):
+            use[:] = True
+    return float(np.mean(v[use])), int(len(v)), int(np.count_nonzero(use))
+
+
+def periodic_fill_radii(angles_deg: np.ndarray, radii: np.ndarray, min_valid: int = 3) -> np.ndarray | None:
+    """Periodic linear interpolation of missing angular radii."""
+    a = np.asarray(angles_deg, dtype=np.float64) % 360.0
+    r = np.asarray(radii, dtype=np.float64)
+    valid = np.isfinite(r)
+    if int(np.count_nonzero(valid)) < min_valid:
+        return None
+    order = np.argsort(a)
+    a_sorted, r_sorted, valid_sorted = a[order], r[order], valid[order]
+    av = a_sorted[valid_sorted]
+    rv = r_sorted[valid_sorted]
+    ae = np.r_[av - 360.0, av, av + 360.0]
+    re = np.r_[rv, rv, rv]
+    filled_sorted = np.interp(a_sorted, ae, re)
+    out = np.empty_like(filled_sorted)
+    out[order] = filled_sorted
+    return out
+
+
+def midpoint_volume(area_mm2: np.ndarray, z_mm: np.ndarray, z_step_mm: float,
+                    lower_mm: float | None = None, upper_mm: float | None = None) -> tuple[float, int]:
+    """Integrate cell-centered areas using clipped midpoint cells."""
+    a = np.asarray(area_mm2, dtype=np.float64)
+    z = np.asarray(z_mm, dtype=np.float64)
+    total = 0.0
+    used = 0
+    for ai, zi in zip(a, z):
+        if not np.isfinite(ai) or ai < 0:
+            continue
+        lo = zi - 0.5 * z_step_mm
+        hi = zi + 0.5 * z_step_mm
+        if lower_mm is not None:
+            lo = max(lo, lower_mm)
+        if upper_mm is not None:
+            hi = min(hi, upper_mm)
+        if hi <= lo:
+            continue
+        total += float(ai) * float(hi - lo)
+        used += 1
+    return float(total), used
+
+
+def volume_row(method: str, volume_mm3: float | None, status: str = "ok", **extra) -> dict:
+    row = {
+        "method": method,
+        "status": status,
+        "volume_mm3": None if volume_mm3 is None else float(volume_mm3),
+        "volume_ml": None if volume_mm3 is None else float(volume_mm3 / 1000.0),
+        "volume_l": None if volume_mm3 is None else float(volume_mm3 / 1_000_000.0),
+    }
+    row.update(extra)
+    return row
+
+
+def write_dict_rows_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8-sig")
+        return
+    fields = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key); fields.append(key)
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (dict,list,tuple)) else v) for k,v in row.items()})
+
+
+def export_inner_profile_points(path: Path, ray_profiles: list[dict], center_native: tuple[float,float], scale_to_mm: float) -> None:
+    groups = []
+    for i, rp in enumerate(ray_profiles):
+        rmm = np.asarray(rp["inner_radius_mm"], dtype=float)
+        z_native = np.asarray(rp["z_native"], dtype=float)
+        valid = np.isfinite(rmm)
+        if not np.any(valid):
+            continue
+        a = math.radians(float(rp["angle_deg"]))
+        rn = rmm[valid] / scale_to_mm
+        pts = np.column_stack([
+            center_native[0] + rn * math.cos(a),
+            center_native[1] + rn * math.sin(a),
+            z_native[valid],
+        ])
+        groups.append((pts, hsv_color(i, len(ray_profiles))))
+    write_combined_points(path, groups)
+
+
+def calculate_capacity_modes(
+    mesh: trimesh.Trimesh,
+    center_native: tuple[float,float],
+    scale_to_mm: float,
+    ray_angles: list[float],
+    full_cache: dict[int, np.ndarray],
+    full_angles: list[float],
+    horizontal_records: list[dict],
+    requested_modes: list[str],
+    single_angle_deg: float,
+    volume_z_step_mm: float,
+    min_angular_valid_fraction: float,
+    volume_dir: Path,
+    make_visualization: bool,
+) -> dict:
+    if volume_z_step_mm <= 0:
+        raise ValueError("--volume-z-step-mm must be positive.")
+    if not (0.0 < min_angular_valid_fraction <= 1.0):
+        raise ValueError("--min-angular-valid-fraction must be in (0,1].")
+    modes = set(requested_modes)
+    if "none" in modes:
+        return {"requested_modes": ["none"], "results": [], "implemented": True}
+    if "all" in modes:
+        modes = {"single", "optimized", "angular", "ellipse"}
+    allowed = {"single", "optimized", "angular", "ellipse"}
+    unknown = modes - allowed
+    if unknown:
+        raise ValueError(f"Unknown volume mode(s): {sorted(unknown)}")
+
+    volume_dir.mkdir(parents=True, exist_ok=True)
+    zmin_native, zmax_native = map(float, mesh.bounds[:,2])
+    step_native = volume_z_step_mm / scale_to_mm
+    z_centers_native = np.arange(zmin_native + 0.5*step_native, zmax_native, step_native, dtype=float)
+    if len(z_centers_native) < 3:
+        raise ValueError("Volume Z step produced fewer than 3 cells.")
+    z_mm = z_centers_native * scale_to_mm
+
+    # Profiles for the standard radial series. Each opposite ray reuses the same full plane.
+    ray_profiles = []
+    for j, angle in enumerate(ray_angles):
+        base_index = j % len(full_angles)
+        rp = extract_ray_inner_profile(
+            full_cache[base_index], center_native, angle, z_centers_native,
+            volume_z_step_mm, scale_to_mm,
+        )
+        ray_profiles.append(rp)
+
+    spans = np.array([
+        (rp["rim_z_mm"] - rp["bottom_z_mm"]) if rp["rim_z_mm"] is not None and rp["bottom_z_mm"] is not None else np.nan
+        for rp in ray_profiles
+    ], dtype=float)
+    finite_spans = spans[np.isfinite(spans)]
+    median_span = float(np.median(finite_spans)) if len(finite_spans) else float("nan")
+    for rp, span in zip(ray_profiles, spans):
+        rp["profile_span_mm"] = None if not np.isfinite(span) else float(span)
+        rp["profile_reliable"] = bool(np.isfinite(span) and (not np.isfinite(median_span) or span >= 0.5 * median_span))
+
+    profile_rows = []
+    for rp in ray_profiles:
+        for k in range(len(z_mm)):
+            profile_rows.append({
+                "angle_deg": rp["angle_deg"],
+                "z_mm": float(z_mm[k]),
+                "z_from_mesh_bottom_mm": float((z_centers_native[k]-zmin_native)*scale_to_mm),
+                "inner_radius_mm": None if not np.isfinite(rp["inner_radius_mm"][k]) else float(rp["inner_radius_mm"][k]),
+                "outer_radius_mm": None if not np.isfinite(rp["outer_radius_mm"][k]) else float(rp["outer_radius_mm"][k]),
+                "positive_intersections": int(rp["positive_intersections"][k]),
+                "profile_reliable": rp["profile_reliable"],
+            })
+    write_dict_rows_csv(volume_dir/"radial_inner_profiles.csv", profile_rows)
+    export_inner_profile_points(volume_dir/"radial_inner_profile_points.ply", ray_profiles, center_native, scale_to_mm)
+
+    reliable = [rp for rp in ray_profiles if rp.get("profile_reliable") and rp.get("rim_z_mm") is not None]
+    physical_spill = min((rp["rim_z_mm"] for rp in reliable), default=None)
+    physical_bottom = max((rp["bottom_z_mm"] for rp in reliable), default=None)
+    min_valid_rays = max(3, int(math.ceil(len(ray_profiles) * min_angular_valid_fraction)))
+
+    results = []
+    method_profiles: dict[str, list[dict]] = {}
+
+    if "single" in modes:
+        # One specified longitudinal plane is represented by its two opposing radial
+        # half-profiles. Their squared radii are averaged at each Z, which defines an
+        # equivalent axisymmetric radius preserving the mean disc area of the two sides.
+        angle = float(single_angle_deg % 360.0)
+        opposite = float((angle + 180.0) % 360.0)
+        matched = {}
+        for target in (angle, opposite):
+            for rp in ray_profiles:
+                if abs(((rp["angle_deg"] - target + 180.0) % 360.0) - 180.0) < 1e-9:
+                    matched[target] = rp; break
+        if len(matched) < 2:
+            seg = section_segments(mesh, center_native, angle)
+            matched[angle] = extract_ray_inner_profile(seg, center_native, angle, z_centers_native, volume_z_step_mm, scale_to_mm)
+            matched[opposite] = extract_ray_inner_profile(seg, center_native, opposite, z_centers_native, volume_z_step_mm, scale_to_mm)
+        rp1, rp2 = matched[angle], matched[opposite]
+        r1=np.asarray(rp1["inner_radius_mm"],float); r2=np.asarray(rp2["inner_radius_mm"],float)
+        both=np.isfinite(r1)&np.isfinite(r2)
+        req=np.full(len(z_mm),np.nan)
+        req[both]=np.sqrt(0.5*(r1[both]*r1[both]+r2[both]*r2[both]))
+        area=math.pi*req*req
+        bottoms=[x for x in (rp1.get("bottom_z_mm"),rp2.get("bottom_z_mm")) if x is not None]
+        rims=[x for x in (rp1.get("rim_z_mm"),rp2.get("rim_z_mm")) if x is not None]
+        lo=max(bottoms) if len(bottoms)==2 else None
+        hi=min(rims) if len(rims)==2 else None
+        if hi is None or lo is None or not np.any(np.isfinite(area)):
+            results.append(volume_row("single",None,status="failed",angle_deg=angle,opposite_angle_deg=opposite,note="Both opposing inner profiles are required for the selected longitudinal plane."))
+        else:
+            vol,cells=midpoint_volume(area,z_mm,volume_z_step_mm,lo,hi)
+            # Side-specific rotational volumes are diagnostics only.
+            v1,_=midpoint_volume(math.pi*r1*r1,z_mm,volume_z_step_mm,rp1.get("bottom_z_mm"),rp1.get("rim_z_mm"))
+            v2,_=midpoint_volume(math.pi*r2*r2,z_mm,volume_z_step_mm,rp2.get("bottom_z_mm"),rp2.get("rim_z_mm"))
+            results.append(volume_row(
+                "single",vol,angle_deg=angle,opposite_angle_deg=opposite,
+                bottom_z_mm=lo,spill_z_mm=hi,z_step_mm=volume_z_step_mm,valid_z_cells=cells,
+                side_a_volume_l=float(v1/1_000_000.0),side_b_volume_l=float(v2/1_000_000.0),
+                note="One full longitudinal plane: equivalent axisymmetric radius sqrt((r_a^2+r_b^2)/2) from the two opposing half-profiles.",
+            ))
+            rows=[]
+            for z,a,b,r,aa in zip(z_mm,r1,r2,req,area):
+                rows.append({"z_mm":float(z),"radius_side_a_mm":None if not np.isfinite(a) else float(a),"radius_side_b_mm":None if not np.isfinite(b) else float(b),"equivalent_radius_mm":None if not np.isfinite(r) else float(r),"area_mm2":None if not np.isfinite(aa) else float(aa)})
+            method_profiles["single"]=rows
+            stem=f"single_section_{int(round(angle))%360:03d}_{int(round(opposite))%360:03d}_profile.csv"
+            write_dict_rows_csv(volume_dir/stem,rows)
+
+    if "optimized" in modes:
+        radii_matrix = np.vstack([np.asarray(rp["inner_radius_mm"], float) for rp in ray_profiles])
+        r_opt = np.full(len(z_mm), np.nan)
+        n_valid = np.zeros(len(z_mm), dtype=int)
+        n_inlier = np.zeros(len(z_mm), dtype=int)
+        for k in range(len(z_mm)):
+            val = radii_matrix[:,k]
+            finite = val[np.isfinite(val)]
+            if len(finite) < min_valid_rays:
+                continue
+            rr, nv, ni = robust_radius(finite, mad_k=3.0)
+            r_opt[k] = rr; n_valid[k]=nv; n_inlier[k]=ni
+        area = math.pi * r_opt*r_opt
+        if physical_spill is None or not np.any(np.isfinite(area)):
+            results.append(volume_row("optimized", None, status="failed", note="Insufficient inner radial profiles."))
+        else:
+            vol,cells=midpoint_volume(area,z_mm,volume_z_step_mm,physical_bottom,physical_spill)
+            results.append(volume_row(
+                "optimized",vol,bottom_z_mm=physical_bottom,spill_z_mm=physical_spill,
+                z_step_mm=volume_z_step_mm,valid_z_cells=cells,radial_directions=len(ray_profiles),
+                min_valid_rays=min_valid_rays,
+                note="Robust mean inner radius across directions; converted to an optimized axisymmetric body.",
+            ))
+            rows=[]
+            for z,rr,aa,nv,ni in zip(z_mm,r_opt,area,n_valid,n_inlier):
+                rows.append({"z_mm":float(z),"optimized_radius_mm":None if not np.isfinite(rr) else float(rr),"area_mm2":None if not np.isfinite(aa) else float(aa),"valid_rays":int(nv),"radius_inliers":int(ni)})
+            method_profiles["optimized"]=rows
+            write_dict_rows_csv(volume_dir/"optimized_rotation_profile.csv",rows)
+
+    if "angular" in modes:
+        angles = np.asarray([rp["angle_deg"] for rp in ray_profiles], dtype=float)
+        radii_matrix = np.vstack([np.asarray(rp["inner_radius_mm"], float) for rp in ray_profiles])
+        area = np.full(len(z_mm), np.nan)
+        valid_counts=np.zeros(len(z_mm),dtype=int); interpolated_counts=np.zeros(len(z_mm),dtype=int)
+        delta_theta = 2.0*math.pi/len(ray_profiles)
+        for k in range(len(z_mm)):
+            vals=radii_matrix[:,k]; valid=np.isfinite(vals); nv=int(np.count_nonzero(valid)); valid_counts[k]=nv
+            if nv < min_valid_rays:
+                continue
+            filled=periodic_fill_radii(angles,vals,min_valid=3)
+            if filled is None:
+                continue
+            interpolated_counts[k]=int(len(vals)-nv)
+            area[k]=0.5*delta_theta*float(np.sum(filled*filled))
+        if physical_spill is None or not np.any(np.isfinite(area)):
+            results.append(volume_row("angular",None,status="failed",note="Insufficient angular inner profiles."))
+        else:
+            vol,cells=midpoint_volume(area,z_mm,volume_z_step_mm,physical_bottom,physical_spill)
+            results.append(volume_row(
+                "angular",vol,bottom_z_mm=physical_bottom,spill_z_mm=physical_spill,
+                z_step_mm=volume_z_step_mm,valid_z_cells=cells,radial_directions=len(ray_profiles),
+                angular_step_deg=float(360.0/len(ray_profiles)),min_valid_rays=min_valid_rays,
+                note="Direct polar area integration A(z)=1/2 integral r(theta,z)^2 dtheta; no axial-symmetry assumption. Missing angles are periodically interpolated only when the minimum valid fraction is met.",
+            ))
+            rows=[]
+            for z,aa,nv,ni in zip(z_mm,area,valid_counts,interpolated_counts):
+                rows.append({"z_mm":float(z),"area_mm2":None if not np.isfinite(aa) else float(aa),"valid_rays":int(nv),"interpolated_rays":int(ni)})
+            method_profiles["angular"]=rows
+            write_dict_rows_csv(volume_dir/"angular_area_profile.csv",rows)
+
+    if "ellipse" in modes:
+        pts=[]
+        for rec in horizontal_records:
+            fit=rec.get("inner_fit")
+            if fit and fit.get("valid"):
+                area_mm2=math.pi*float(fit["semi_major_mm"])*float(fit["semi_minor_mm"])
+                pts.append((float(rec["z_mm"]),area_mm2,rec.get("section_id")))
+        pts.sort()
+        if len(pts) < 3:
+            results.append(volume_row("ellipse",None,status="failed",note="Fewer than 3 valid inner horizontal ellipses."))
+        elif physical_spill is None:
+            results.append(volume_row("ellipse",None,status="failed",note="No reliable spill level could be estimated from radial profiles."))
+        else:
+            zz=np.array([p[0] for p in pts],float); aa=np.array([p[1] for p in pts],float)
+            # Use the radial-profile cavity limits for integration bounds; the ellipse
+            # areas themselves remain independent horizontal-section measurements.
+            lo=float(physical_bottom if physical_bottom is not None else zz.min())
+            hi=float(physical_spill)
+            grid=z_mm[(z_mm>=lo)&(z_mm<=hi)]
+            if len(grid)==0:
+                results.append(volume_row("ellipse",None,status="failed",note="No Z cells within ellipse integration bounds."))
+            else:
+                area_grid=np.interp(grid,zz,aa)
+                vol,cells=midpoint_volume(area_grid,grid,volume_z_step_mm,lo,hi)
+                results.append(volume_row(
+                    "ellipse",vol,bottom_z_mm=lo,spill_z_mm=hi,z_step_mm=volume_z_step_mm,
+                    valid_z_cells=cells,horizontal_ellipse_sections=len(pts),
+                    note="Horizontal inner-ellipse area pi*a*b interpolated along Z; intended as an independent QA method.",
+                ))
+                rows=[{"section_id":sid,"z_mm":z,"ellipse_area_mm2":a} for z,a,sid in pts]
+                method_profiles["ellipse"]=rows
+                write_dict_rows_csv(volume_dir/"horizontal_ellipse_area_samples.csv",rows)
+
+    write_dict_rows_csv(volume_dir/"volume_summary.csv",results)
+    write_json(volume_dir/"volume_summary.json",{
+        "requested_modes": sorted(modes),
+        "volume_z_step_mm": float(volume_z_step_mm),
+        "radial_angles_deg": [float(x) for x in ray_angles],
+        "min_angular_valid_fraction": float(min_angular_valid_fraction),
+        "min_valid_rays": int(min_valid_rays),
+        "physical_spill_z_mm_estimate": physical_spill,
+        "physical_common_bottom_z_mm_estimate": physical_bottom,
+        "spill_definition": "lowest reliable radial inner-profile rim height; resolution approximately +/- half volume_z_step_mm",
+        "results": results,
+    })
+
+    if make_visualization and results:
+        try:
+            import matplotlib; matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            ok=[r for r in results if r.get("status")=="ok" and r.get("volume_l") is not None]
+            if ok:
+                fig,ax=plt.subplots(figsize=(7.2,4.8))
+                ax.bar([r["method"] for r in ok],[r["volume_l"] for r in ok])
+                ax.set_ylabel("Volume [L]"); ax.set_title("Capacity estimates by method")
+                fig.tight_layout(); fig.savefig(volume_dir/"volume_method_comparison.png",dpi=220); plt.close(fig)
+            # Plot all extracted ray profiles in r-z space for geometric QA.
+            fig,ax=plt.subplots(figsize=(7.0,7.4))
+            for rp in ray_profiles:
+                rr=np.asarray(rp["inner_radius_mm"],float); good=np.isfinite(rr)
+                if np.any(good): ax.plot(rr[good],z_mm[good],linewidth=.7,alpha=.5)
+            ax.set_xlabel("Inner radius [mm]"); ax.set_ylabel("Z [mm]"); ax.set_title("Inner radial profiles used for capacity calculation")
+            fig.tight_layout(); fig.savefig(volume_dir/"radial_inner_profiles.png",dpi=220); plt.close(fig)
+        except Exception as exc:
+            write_json(volume_dir/"visualization_warning.json",{"warning":str(exc)})
+
+    return {
+        "requested_modes": sorted(modes), "results": results,
+        "volume_z_step_mm": float(volume_z_step_mm),
+        "physical_spill_z_mm_estimate": physical_spill,
+        "physical_common_bottom_z_mm_estimate": physical_bottom,
+        "radial_profile_count": len(ray_profiles),
+    }
+
 def make_oblique_plot(mesh, groups, path, scale_to_mm, title, max_mesh_points=50000, max_group_points=9000):
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -713,7 +1243,8 @@ def write_axis_summary_csv(path: Path, summary: dict) -> None:
 def process(input_path: Path, unit: str, step_deg: float, start_deg: float, axis_surface: str,
             z_sections: int | None, z_step_mm: float | None, center_outlier_mad: float,
             contour_spacing_mm: float, sample_spacing_mm: float, output_dir: Path | None,
-            make_visualization: bool) -> dict:
+            make_visualization: bool, volume_modes: list[str], single_angle_deg: float,
+            volume_z_step_mm: float, min_angular_valid_fraction: float) -> dict:
     if unit not in UNIT_SCALE_TO_MM: raise ValueError(f"Unsupported unit: {unit}")
     if contour_spacing_mm<=0 or sample_spacing_mm<=0: raise ValueError("Sampling spacings must be positive.")
     if center_outlier_mad<=0: raise ValueError("--center-outlier-mad must be positive.")
@@ -726,8 +1257,8 @@ def process(input_path: Path, unit: str, step_deg: float, start_deg: float, axis
         step_label=f"{step_deg:g}".replace(".","p")
         output_dir=input_path.parent/f"{input_path.stem}_RadialSections_{step_label}deg"
     full_dir=output_dir/"full_sections"; ray_dir=output_dir/"radial_half_sections"; vis_dir=output_dir/"visualization"
-    axis_dir=output_dir/"axis_estimation"; horiz_dir=axis_dir/"horizontal_sections"
-    for p in (full_dir,ray_dir,vis_dir,axis_dir,horiz_dir): p.mkdir(parents=True,exist_ok=True)
+    axis_dir=output_dir/"axis_estimation"; horiz_dir=axis_dir/"horizontal_sections"; volume_dir=output_dir/"volume"
+    for p in (full_dir,ray_dir,vis_dir,axis_dir,horiz_dir,volume_dir): p.mkdir(parents=True,exist_ok=True)
 
     z_values,z_sampling=horizontal_z_positions(zmin,zmax,scale,z_sections,z_step_mm)
     closure_tol_native=0.05/scale
@@ -832,6 +1363,25 @@ def process(input_path: Path, unit: str, step_deg: float, start_deg: float, axis
     with (output_dir/"sections_summary.csv").open("w",newline="",encoding="utf-8-sig") as f:
         fields=["type","angle_deg","opposite_angle_deg","segments","sampled_points"]; w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(summary_rows)
 
+    print("\n=== Capacity calculation ===")
+    print(f"volume mode(s) : {', '.join(volume_modes)}")
+    if "single" in volume_modes or "all" in volume_modes:
+        print(f"single angle   : {single_angle_deg:g} deg")
+    print(f"volume Z step  : {volume_z_step_mm:g} mm")
+    volume_summary=calculate_capacity_modes(
+        mesh=mesh, center_native=center_native, scale_to_mm=scale,
+        ray_angles=ray_angles, full_cache=full_cache, full_angles=full_angles,
+        horizontal_records=horizontal_records, requested_modes=volume_modes,
+        single_angle_deg=single_angle_deg, volume_z_step_mm=volume_z_step_mm,
+        min_angular_valid_fraction=min_angular_valid_fraction,
+        volume_dir=volume_dir, make_visualization=make_visualization,
+    )
+    for vr in volume_summary.get("results",[]):
+        if vr.get("status")=="ok":
+            print(f"{vr['method']:10s}: {vr['volume_l']:.6f} L")
+        else:
+            print(f"{vr['method']:10s}: FAILED - {vr.get('note','')}")
+
     if make_visualization:
         make_oblique_plot(mesh,horizontal_groups,vis_dir/"horizontal_sections_oblique.png",scale,"Horizontal sections used for rotation-axis estimation")
         make_oblique_plot(mesh,full_groups,vis_dir/"full_sections_oblique.png",scale,"Full longitudinal sections through estimated rotation axis")
@@ -853,8 +1403,9 @@ def process(input_path: Path, unit: str, step_deg: float, start_deg: float, axis
         "section_ply_coordinate_system":"same XYZ coordinate system and unit as input mesh",
         "wall_thickness_used_for_axis":False,
         "outer_mode_note":"If axis_surface=outer, wall thickness is intentionally not used here; single or Z-positioned thickness measurements can be used later for inner-profile reconstruction and volume calculation.",
-        "tilt_note":"Center drift versus Z is diagnostic only; the model is not auto-rotated or tilt-corrected in v0.3.0.",
-        "volume_reconstruction_implemented":False,
+        "tilt_note":"Center drift versus Z is diagnostic only; the model is not auto-rotated or tilt-corrected in v0.4.0.",
+        "volume_reconstruction_implemented":True,
+        "volume_calculation":volume_summary,
     }
     write_json(output_dir/"metadata.json",metadata)
     print("\n=== Rotation axis ===")
@@ -868,7 +1419,7 @@ def process(input_path: Path, unit: str, step_deg: float, start_deg: float, axis
 
 
 def main():
-    parser=argparse.ArgumentParser(description="Estimate a pottery rotation axis from horizontal ellipse centers, then extract longitudinal radial sections.")
+    parser=argparse.ArgumentParser(description="Estimate a pottery rotation axis, extract radial sections, and calculate vessel capacity with selectable methods.")
     parser.add_argument("input",type=Path,help="Input PLY or OBJ mesh")
     parser.add_argument("--unit",choices=["mm","cm","m"],required=True,help="Coordinate unit of input mesh")
     parser.add_argument("--axis-surface",choices=["inner","outer","both"],default="inner",help="Contour used for final axis. 'both' fits both for QC but uses inner centers (default: inner)")
@@ -880,13 +1431,22 @@ def main():
     parser.add_argument("--angle-step",type=float,default=30.0,help="Longitudinal radial angular interval [deg] (default: 30)")
     parser.add_argument("--start-angle",type=float,default=0.0,help="Start azimuth [deg] (default: 0)")
     parser.add_argument("--sample-spacing-mm",type=float,default=0.5,help="PLY point-cloud sampling interval [mm] (default: 0.5)")
+    parser.add_argument("--volume-mode",nargs="+",choices=["all","single","optimized","angular","ellipse","none"],default=["all"],
+                        help="Capacity method(s). Use one or more: all, single, optimized, angular, ellipse, none (default: all)")
+    parser.add_argument("--single-angle",type=float,default=0.0,
+                        help="Radial half-profile angle used by single volume mode [deg] (default: 0)")
+    parser.add_argument("--volume-z-step-mm",type=float,default=0.5,
+                        help="Z sampling step for longitudinal-profile volume integration [mm] (default: 0.5)")
+    parser.add_argument("--min-angular-valid-fraction",type=float,default=0.75,
+                        help="Minimum fraction of radial directions required at a Z cell for optimized/angular modes (default: 0.75)")
     parser.add_argument("--output-dir",type=Path,help="Output directory")
     parser.add_argument("--no-visualization",action="store_true",help="Do not generate PNG reference/QC images")
     parser.add_argument("--version",action="version",version=f"%(prog)s {__version__}")
     args=parser.parse_args()
     try:
         process(args.input,args.unit,args.angle_step,args.start_angle,args.axis_surface,args.z_sections,args.z_step_mm,
-                args.center_outlier_mad,args.contour_spacing_mm,args.sample_spacing_mm,args.output_dir,not args.no_visualization)
+                args.center_outlier_mad,args.contour_spacing_mm,args.sample_spacing_mm,args.output_dir,not args.no_visualization,
+                args.volume_mode,args.single_angle,args.volume_z_step_mm,args.min_angular_valid_fraction)
     except Exception as exc:
         parser.exit(1,f"ERROR: {exc}\n")
 
