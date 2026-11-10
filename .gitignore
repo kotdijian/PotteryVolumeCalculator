@@ -1,0 +1,5 @@
+__pycache__/
+.venv/
+venv/
+*_PotteryVolume_v1/
+*_PoseComparison/

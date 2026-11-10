@@ -8,18 +8,21 @@ The repository currently contains three complementary workflows:
 2. **PotteryRadialSections** — derives radial section profiles from a 3D mesh and estimates capacity using section-based numerical models.
 3. **PotteryDrawingCapacity** — digitizes left/right inner profiles from a 2D drawing and evaluates them with the same `single` integration core used by PotteryRadialSections.
 
-The section/profile workflows share `pottery_volume_core.py`. The voxel-fluid workflow is methodologically independent and does not call the shared profile-integration core.
+The voxel-fluid workflow runs independently of the section and drawing tools. The v0.6.0 sections below document a historical workflow that used a shared integration module. For the extension scripts bundled in this checkout, see [the drawing and section guide](README_draw.md) and each script’s `--help`.
 
 ## Contents
 
-- [PotteryVolumeCalculator — voxel-fluid method](#potteryvolumecalculator-v131)
+- [PotteryVolumeCalculator — voxel-fluid method](#potteryvolumecalculator-v140)
 - [PotteryRadialSections — radial-section method](#potteryradialsections-v060)
 - [PotteryDrawingCapacity — drawing-based method](#potterydrawingcapacity-v060)
+- [AOM posture comparison](#compare-postures-exported-by-aom)
+- [Validation report v1.3.1 (PDF)](docs/validation/PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf)
+- [Radial section example output](examples/0015Jinmen_small_RadialSections_30deg)
 
 ---
 
 
-## PotteryVolumeCalculator v1.3.1
+## PotteryVolumeCalculator v1.4.0
 
 Experimental Python CLI for estimating the **maximum retained liquid capacity** of a pottery 3D mesh using a voxel-based fluid-space method.
 
@@ -45,6 +48,20 @@ PLY / OBJ
 ```
 
 The voxel-fluid implementation is independent of the section/profile-based `PotteryRadialSections`, `PotteryDrawingCapacity`, and `PotteryVolumeCore` workflow.
+
+
+### Compare postures exported by AOM
+
+In [ArtefactsOrthoMaker](https://github.com/kotdijian/ArtefactsOrthoMaker#pottery-pose), export the same input mesh separately for each posture you want to compare (Rim, Base, or Slice). Pass two or more export folders containing `item_manifest.json`, `transform.json`, and the normalized `*_rev.ply`.
+
+```bash
+python3 vessel_voxel_volume.py --compare-poses "AOM/output/cup" "AOM/output/cup/revisions/BASE_REV" "AOM/output/cup/revisions/SLICE_REV" --pitch 1.0 --pose-baseline rim --output-dir "cup_PoseComparison"
+```
+
+Use the same original mesh and any identical reconstruction for every posture. The comparison reads the unit from AOM and verifies the two exported files against their manifest digests. It uses the normalized PLY directly. The existing `--validate` workflow checks voxel-pitch convergence separately.
+
+An accepted Slice is included in the primary comparison. Add `--include-reference-slice` to calculate a separately labeled reference Slice. Held or unassessed Slice exports are skipped. The default baseline is the first successful primary mode in Rim, Base, accepted Slice order. Use a fresh output directory. The JSON and CSV summaries record the baseline, angles, spill levels, capacity differences, and any skips or failures. Each posture has its own output subfolder.
+
 
 ### Capacity definition
 

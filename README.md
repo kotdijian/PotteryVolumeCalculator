@@ -1,8 +1,14 @@
-# PotteryVolumeCalculator v1.3.2
+# PotteryVolumeCalculator v1.4.0
 
 PLY / OBJ形式の土器3Dメッシュから、**液体が最初に外へ溢れ出す直前までの最大内容量**をvoxel法で推定する実験用ツールです。
 
-v1.3では、用途に応じて次の2モードを並列実装しています。v1.3.2では、voxelization前のscale / resource preflightを追加しました。
+通常計算、ピッチ収束の検証、AOM出力の姿勢別比較に対応します。
+
+- [AOM出力を使った姿勢別容量比較](#aom-pose-comparison)
+- [English README](README_EN.md)
+- [関連ツールの手順（断面・図面）](README_draw.md) / [旧版の断面プロファイル手順](README_profile.md)
+- [開発・検証レポート v1.3.1（PDF）](docs/validation/PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf)
+- [サンプルの放射断面出力](examples/0015Jinmen_small_RadialSections_30deg)
 
 ## このプログラムに適した3Dモデル
 
@@ -80,6 +86,7 @@ Gitを利用している場合は`git clone`でも構いませんが、初めて
 ```text
 PotteryVolumeCalculator/
 ├── vessel_voxel_volume.py
+├── pose_comparison.py
 ├── README.md
 ├── requirements.txt
 └── requirements-core.txt
@@ -641,6 +648,25 @@ spill level
 容量計算では重力方向を-Zとみなし、液面をZ方向に上昇させます。
 
 姿勢が誤っていると、spill-levelがまったく異なる値になります。
+
+
+<a id="aom-pose-comparison"></a>
+## AOM出力を使った姿勢別容量比較
+
+[ArtefactsOrthoMaker (AOM)](https://github.com/kotdijian/ArtefactsOrthoMaker#pottery-pose) で同じ土器を Rim・Base・Slice のうち比較したい姿勢に切り替え、各姿勢で **「資料を書き出す」** を実行します。初回の出力は資料フォルダに、以降の出力はその中の `revisions/` に保存されます。
+
+比較には、各姿勢の `item_manifest.json`、`transform.json`、正規化済みの `*_rev.ply` が揃ったフォルダを2つ以上指定します。下記のフォルダ名は例です。実際の出力先に置き換えてください。
+
+```bash
+python3 vessel_voxel_volume.py --compare-poses "AOM/output/cup" "AOM/output/cup/revisions/BASE_REV" "AOM/output/cup/revisions/SLICE_REV" --pitch 1.0 --pose-baseline rim --output-dir "cup_PoseComparison"
+```
+
+- AOMのマニフェストで元モデルの同一性と座標単位を照合し、PLYとTransformのファイルサイズ・SHA-256を検証します。座標単位はAOM出力から取得し、正規化済みPLYをそのまま計算します。補完したモデルを使う場合は、補完後の**同じモデル**をAOMに入力して各姿勢を書き出してください。
+- 比較に使うのは共通の単一ピッチです。`--pitch` の既定値は1.0 mmです。従来の `--validate` は1姿勢に対するピッチ収束の検証で、姿勢比較とは別に実行します。
+- Sliceの **採用** は通常の比較に含めます。**参考** は `--include-reference-slice` を付けた場合に試算し、比較表で参考と区別します。**保留**、またはSlice判定が記録されていない旧出力はスキップします。Sliceを保留した後にRimやBaseを書き出した場合は、その出力に記録された保留理由も一覧に反映します。
+- 基準姿勢は `--pose-baseline rim|base|slice` で指定します。省略時は、計算に成功した Rim、Base、採用Sliceの順です。角度差は元の座標系での上方向の差です。容量差は「対象の容量 − 基準の容量」、百分率の分母は基準の容量です。
+- 新規の出力フォルダに `pose_comparison.json` と `pose_comparison.csv` を保存し、各姿勢の詳細を `rim/`、`base/`、`slice/` に分けます。溢水位は正規化済みモデルのZ座標と、そのモデルの最下点からの高さを併記します。計算できた姿勢が2つ未満、または一部で計算が失敗した場合は、理由を一覧に保存してエラー終了します。
+
 
 ---
 
