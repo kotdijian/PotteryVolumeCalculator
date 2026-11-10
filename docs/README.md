@@ -9,7 +9,9 @@
 | [`pottery_radial_sections.py`](../pottery_radial_sections.py) | 3Dメッシュの放射断面と断面法容量。[v0.4.0の操作手順](radial-sections-v0.4.0.md) |
 | [`pottery_drawing_capacity.py`](../pottery_drawing_capacity.py) | 2D図面から内面プロファイルを指定して容量を計算するGUI。[v0.5.0の操作手順](drawing-capacity-v0.5.0.md) |
 | [`pottery_fragment_boundary.py`](../pottery_fragment_boundary.py) | 接合・破断境界の候補を調べるCLI |
-| [`pottery_surface_trace.py`](../pottery_surface_trace.py) | 表面の形状変化を複数のスケールで調べるCLI。[v0.1.0の検証記録](validation/surface-trace-v0.1.0.md) |
+| [表面痕跡解析（MorphPot）](https://github.com/kotdijian/MorphPot/blob/main/README.md#surface-trace) | 表面の多尺度形状解析は今後MorphPotで開発します。[従来のCLI](../pottery_surface_trace.py) と [v0.1.0の検証記録](validation/surface-trace-v0.1.0.md) は既存の手順を再現するために参照できます。 |
+
+放射断面は断面法による容量計算に使うため、このリポジトリにも収録しています。放射断面の形態解析や容量計算を伴わない断面抽出には [MorphPotの放射断面ガイド](https://github.com/kotdijian/MorphPot/blob/main/README.md#radial-sections-guide) を参照してください。
 
 関連ツールの引数は、たとえば `python3 pottery_radial_sections.py --help` で確認できます。図面GUIにはTkinterが必要です。SVG・PDFを開く場合はPyMuPDF、放射断面のPNG図版を生成する場合はMatplotlibを追加してください。
 

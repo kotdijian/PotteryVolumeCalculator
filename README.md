@@ -7,6 +7,7 @@ PLY / OBJ形式の土器3Dメッシュから、**液体が最初に外へ溢れ�
 - [AOM出力を使った姿勢別容量比較](#aom-pose-comparison)
 - [English README](README_EN.md)
 - [関連ツールとリポジトリ構成](docs/README.md)
+- [表面痕跡解析の開発・利用先（MorphPot）](https://github.com/kotdijian/MorphPot/blob/main/README.md#surface-trace)
 - [開発・検証レポート v1.3.1（PDF）](docs/validation/PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf)
 - [サンプルの放射断面出力](examples/0015Jinmen_small_RadialSections_30deg)
 
