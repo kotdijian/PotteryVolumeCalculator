@@ -6,7 +6,7 @@ PLY / OBJ形式の土器3Dメッシュから、**液体が最初に外へ溢れ�
 
 - [AOM出力を使った姿勢別容量比較](#aom-pose-comparison)
 - [English README](README_EN.md)
-- [関連ツールの手順（断面・図面）](README_draw.md) / [旧版の断面プロファイル手順](README_profile.md)
+- [関連ツールとリポジトリ構成](docs/README.md)
 - [開発・検証レポート v1.3.1（PDF）](docs/validation/PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf)
 - [サンプルの放射断面出力](examples/0015Jinmen_small_RadialSections_30deg)
 
@@ -1145,25 +1145,11 @@ pitch_Xmm/qa/preflight_scale_resource.json
 
 ---
 
-# 21. 自己検証
+# 21. 検証資料
 
-配布前検証の詳細は、
-
-```text
-SELF_TEST.md
-```
-
-を参照してください。
-
-v1.3.2では、従来の計算系テストに加えて、
-
-- 正常な100 mm synthetic vesselがpreflightを通過して容量計算まで完走
-- mm座標を誤って`--unit m`とした場合、推定gridが約10^15 cellsとなりvoxelization前にhard stop
-- m座標を誤って`--unit mm`とした場合、pitchに対して極端な低解像度としてhard stop
-- 正しい`0015Jinmen_small.ply`相当寸法では2 / 1 / 0.5 mmがpreflightを通過
-- `archaeological/raw_*`が生成されない
-
-ことを確認しています。詳細は`SELF_TEST.md`を参照してください。
+- [ボクセル溢水法の開発・検証レポート v1.3.1（PDF）](docs/validation/PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf) は、0015 Jinmenでのピッチ収束と溢水位を記録しています。
+- v1.4.0の確認では、仮想土器でAOM姿勢別比較、Sliceの採否による分岐、ピッチ検証を実行しました。実資料0015 Jinmenでは、2 mmピッチで単一姿勢の計算を確認しました。
+- [表面痕跡解析の自己検証記録](docs/validation/surface-trace-v0.1.0.md) は、関連ツールのPotterySurfaceTraceAnalyzerを対象としています。
 
 ---
 

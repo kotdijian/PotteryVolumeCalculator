@@ -62,11 +62,11 @@ v1.3.1は、v1.3.0で確立した容量計算ロジックを変更せず、**考
 
 Zが器高方向となる直立姿勢である。
 
-![元モデル](figures/fig01_original_model_perspective.png)
+[元モデルの図版（PDF p. 3）](PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf#page=3)
 
 **図1　`0015Jinmen_small.ply`の3D形状。** PLY内のvertex RGBを用いた表示。外部texture画像は用いていない。
 
-![正面](figures/fig03_original_model_front.png)
+[正面の図版（PDF p. 4）](PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf#page=4)
 
 **図2　正面方向からの正投影。**
 
@@ -296,7 +296,7 @@ raw boundary関連処理は容量計算には使用していなかったため�
 
 ## 11. 中央縦断面とspill level
 
-![断面](figures/fig02_central_section_spill_levels.png)
+[断面の図版（PDF p. 11）](PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf#page=11)
 
 **図3　中央縦断面とspill level。** 0.5 mm pitchではspill upper level = 241 mm、1.0 / 2.0 mm pitchでは242 mmである。
 
@@ -323,11 +323,11 @@ pitchを細かくすると容量は、
 - 1.0 mmと0.5 mmの差: **0.513%（0.5 mm値に対して）**
 - spill upper levelの全変動幅: **1.0 mm**
 
-![容量収束](figures/fig05_pitch_volume_convergence.png)
+[容量収束の図版（PDF p. 12）](PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf#page=12)
 
 **図4　voxel pitchと最大保持容量。** pitch細分化に伴い容量値の変化量が縮小している。
 
-![spill収束](figures/fig06_pitch_spill_convergence.png)
+[spill収束の図版（PDF p. 13）](PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf#page=13)
 
 **図5　voxel pitchとspill upper level。** 3解像度の差は1 mm以内である。
 
@@ -351,7 +351,7 @@ pitchを細かくすると容量は、
 
 ## 13. fluid surfaceの形状確認
 
-![fluid](figures/fig04_fluid_surface_0p5mm.png)
+[fluidの図版（PDF p. 14）](PotteryVolumeCalculator_development_validation_report_v1.3.1.pdf#page=14)
 
 **図6　0.5 mm pitchで得たfluid surfaceと元モデルの重ね合わせ。** fluid regionは底部から器内へ連続し、上面は口縁直下のspill levelで水平となる。
 
